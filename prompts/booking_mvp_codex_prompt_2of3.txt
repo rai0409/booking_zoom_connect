@@ -1,0 +1,131 @@
+Continue from Part 1.
+
+# Timezone rule (MUST implement)
+- Persist all timestamps in DB as UTC (timestamptz).
+- Client/UI displays times in tenant default timezone (tenant_config) or salesperson.timezone.
+- When creating Zoom/Graph events, include explicit timezone strings (IANA where supported). Convert from UTC for provider calls.
+- All API inputs accept ISO8601 with timezone; normalize to UTC immediately.
+
+# Data model (Prisma)
+Implement these tables exactly (add missing necessary fields too):
+- tenants(id, name, slug, m365_tenant_id, status, created_at)
+- salespersons(id, tenant_id, graph_user_id, display_name, timezone, active)
+- customers(id, tenant_id, name, email, company)
+- bookings(
+    id, tenant_id, salesperson_id, customer_id,
+    start_at_utc, end_at_utc,
+    status [hold|pending_verify|confirmed|canceled|expired],
+    idempotency_key,
+    verify_token_jti (nullable),
+    created_at, updated_at
+  )
+- holds(booking_id, expires_at_utc)
+- meetings(booking_id, provider [zoom|teams], provider_meeting_id, join_url, start_url, created_at)
+- graph_events(booking_id, organizer_user_id, event_id, iCalUId, etag, updated_at)
+- tracking_events(id, tenant_id, booking_id, type, occurred_at_utc, meta_json)
+- audit_logs(id, tenant_id, actor_type, actor_id, action, target_type, target_id, meta_json, created_at_utc)
+- webhook_jobs(id, tenant_id, salesperson_id, subscription_id, change_type, resource_id, received_at_utc, status, attempts, last_error, created_at_utc)
+
+# Booking state machine (MUST implement as a table in README + enforce in code)
+States:
+- hold: created by /holds; has holds.expires_at_utc (TTL 10m). Not yet verified.
+- pending_verify: verification email sent; verify token is valid until hold expiration (or a separate short TTL, e.g., 15m).
+- confirmed: Zoom + Graph event created, customer invited.
+- canceled: explicitly canceled by customer before deadline.
+- expired: TTL passed before confirmation; system auto-expires.
+
+Transitions:
+- (none) -> hold (POST /holds)
+- hold -> pending_verify (POST /auth/verify-email)
+- hold|pending_verify -> expired (TTL worker)
+- pending_verify -> confirmed (POST /confirm with valid token, before expires)
+- confirmed -> canceled (POST /bookings/:id/cancel before deadline)
+- confirmed -> hold (reschedule flow: cancel then create new hold)
+Rules:
+- If hold expires, confirm must fail with 409 and mark expired.
+- Only one “active booking” per (tenant_id, salesperson_id, start_at_utc, end_at_utc) is allowed where active = {hold,pending_verify,confirmed}. Expired/canceled do not block.
+- Confirm is a saga: create Zoom -> create Graph -> persist both -> set booking confirmed. Must be idempotent.
+
+# DB constraints & locking (MUST implement to prevent double-booking)
+- Add a UNIQUE constraint to enforce active-slot uniqueness. Use a partial unique index in Postgres:
+  UNIQUE (tenant_id, salesperson_id, start_at_utc, end_at_utc) WHERE status IN ('hold','pending_verify','confirmed')
+- Add UNIQUE on bookings.idempotency_key per tenant: UNIQUE(tenant_id, idempotency_key)
+- Use transactions for hold/confirm/cancel/reschedule.
+- If Prisma cannot express partial unique index cleanly, include a SQL migration with `CREATE UNIQUE INDEX ... WHERE ...`.
+- Additionally, during confirm, acquire an advisory lock keyed by booking_id to prevent concurrent confirm attempts:
+  pg_advisory_xact_lock(hashtext(booking_id)) (or bigint hash) within the transaction.
+
+# REST API (/v1) - implement exactly
+Tenant resolution:
+- For public pages use tenant_slug in URL: /v1/public/:tenantSlug/...
+- For internal calls allow tenant_id, but public endpoints must primarily use tenant_slug.
+
+Endpoints:
+1) GET /v1/public/:tenantSlug/availability?salesperson=...&date=YYYY-MM-DD
+   - Generate 60-min slots (default) with buffer +/- 10 min.
+   - Read Graph calendar busy times for salesperson.graph_user_id.
+   - Cache per (tenant_id, salesperson_id, date) for 30–60 seconds.
+
+2) POST /v1/public/:tenantSlug/holds
+   - Headers: Idempotency-Key required
+   - body: { salesperson_id, start_at, end_at, customer: { email, name?, company? } }
+   - Normalize times to UTC.
+   - Create/Upsert customer by (tenant_id, email).
+   - Create booking status=hold + holds row expires_at_utc=now+10m.
+   - On uniqueness conflict (slot already active), return 409.
+
+3) POST /v1/public/:tenantSlug/auth/verify-email
+   - Headers: Idempotency-Key required
+   - body: { booking_id }
+   - If booking is hold and not expired:
+     - generate short-lived JWT verify token (exp <= holds.expires_at_utc)
+     - include jti; store verify_token_jti in bookings
+     - send email from shared mailbox with link:
+       `${BASE_URL}/verify?token=...`
+     - set status=pending_verify
+   - If already pending_verify and token not expired, re-send same token (idempotent).
+   - If expired, mark expired and return 409.
+
+4) POST /v1/public/:tenantSlug/confirm
+   - Headers: Idempotency-Key required
+   - body: { token }
+   - Verify JWT (iss/aud/exp), extract tenant_id, booking_id, jti.
+   - Enforce one-time use:
+     - compare jti with bookings.verify_token_jti
+     - mark token as consumed by clearing verify_token_jti (or storing consumed_jti table)
+   - Confirm saga within transaction + advisory lock:
+     a) create Zoom meeting (retry on transient errors)
+     b) create Graph event with attendees including customer.email, include booking_id + join_url in subject/body/location
+     c) persist meetings + graph_events rows
+     d) set booking status=confirmed
+     e) write tracking_events + audit_logs
+   - If Zoom succeeded but Graph failed: record a compensation task (e.g., a “compensation_jobs” table or reuse webhook_jobs), and attempt to delete Zoom meeting best-effort.
+
+5) POST /v1/public/:tenantSlug/bookings/:id/cancel
+   - Headers: Idempotency-Key required
+   - body: { token }  (JWT for cancel; same security rules)
+   - Validate deadline: now <= start_at_utc - 24h
+   - Cancel Graph event (delete or cancel) + delete Zoom meeting best-effort
+   - Set booking status=canceled, write tracking/audit.
+   - If already canceled, return 200 (idempotent).
+
+6) POST /v1/public/:tenantSlug/bookings/:id/reschedule
+   - Headers: Idempotency-Key required
+   - body: { token, new_start_at, new_end_at }
+   - Validate deadline for cancel.
+   - Implement minimal: cancel old booking then create new hold and send verify email in same call OR return new booking_id and require verify-email call.
+   - Ensure idempotency & slot uniqueness.
+
+7) POST /v1/internal/attendance/:bookingId
+   - Header: X-Admin-Api-Key required; also tenant scope required via header X-Tenant-Id or booking’s tenant_id must match key scope.
+   - body: { status: 'attended'|'no_show' }
+   - Write tracking_event + audit_log.
+
+8) POST /v1/webhooks/graph
+   - If query has validationToken, return it as plain text immediately.
+   - Otherwise:
+     - parse notifications
+     - respond 202 within 10 seconds
+     - enqueue each notification into queue as webhook job with schema defined in Part 3.
+
+Continue in Part 3 with: queue payload schema, worker behavior, Graph subscription renewal, Outlook manual-change policy, security (JWT aud/iss/exp + one-time jti), local dev, tests, and Azure Container Apps deployment notes.

@@ -1,0 +1,103 @@
+Continue from Parts 1–2.
+
+# Webhook queue payload schema (MUST be explicit and used across receiver/worker)
+Define a shared TypeScript type + zod schema:
+GraphWebhookJobPayload = {
+  tenant_id: string,
+  salesperson_id: string,
+  subscription_id: string,
+  change_type: string,          // created|updated|deleted (or resourceData.changeType when available)
+  resource_id: string,          // eventId (extract from resource or resourceData.id)
+  received_at_utc: string       // ISO8601 UTC
+}
+
+# Worker responsibilities (MUST implement)
+- Dequeue GraphWebhookJobPayload.
+- Fetch latest event details from Graph for that tenant + salesperson.
+- Reconcile with DB:
+  - locate booking by graph_events.event_id OR by booking_id embedded in event body/subject (fallback).
+  - if event moved (start/end changed) and booking is confirmed:
+    - update bookings.start_at_utc/end_at_utc to match Graph
+    - write tracking_events type="event_moved_by_sales" + audit_log
+    - DO NOT email customer in v1.0; instead record a tracking_event "customer_reinvite_required" with meta.
+  - if event deleted/canceled and booking is confirmed:
+    - set booking status=canceled (source="sales_manual")
+    - write tracking/audit
+    - DO NOT email customer in v1.0; record tracking_event "customer_notify_required".
+- Idempotency: webhook jobs must be safe to retry. Store attempts and last_error in webhook_jobs table.
+- Backoff: retry failed jobs with exponential backoff; cap attempts (e.g., 10). Dead-letter to webhook_jobs.status="dead".
+
+# Outlook manual-change policy (MUST be explicit)
+v1.0 policy:
+- Manual move of confirmed event => booking follows organizer’s calendar change (DB updated), but customer is NOT automatically re-invited; system flags it for manual follow-up (tracking events).
+- Manual deletion of confirmed event => booking is canceled; system flags customer notification required.
+This avoids accidental customer spam and keeps “truth” aligned with salesperson calendar.
+
+# Graph subscriptions (MUST implement minimal renewal)
+- Provide a scheduled job (cron) that:
+  - for each active tenant + active salesperson:
+    - ensures a valid events subscription exists
+    - renews subscription before expiration
+- Store subscription metadata in DB:
+  - graph_subscriptions(id, tenant_id, salesperson_id, subscription_id, resource, expiration_utc, created_at_utc, updated_at_utc)
+- Webhook URL = `${BASE_URL}/v1/webhooks/graph`.
+- If subscription creation fails, write audit_logs + keep retrying.
+
+# Token caching
+- Implement per-tenant token cache in API process:
+  - key: tenant.m365_tenant_id
+  - value: { access_token, expires_at_utc }
+- Always refresh before expiry (e.g., 60s early).
+
+# Zoom S2S OAuth
+- Implement token fetch + cache.
+- Create meeting with timezone specified.
+- Persist join_url/start_url/provider_meeting_id.
+
+# Security hardening (MUST implement)
+JWT tokens (verify/cancel/reschedule):
+- include: iss, aud, exp, jti, tenant_id, booking_id, purpose
+- verify:
+  - iss must equal BASE_URL
+  - aud must equal "booking-system"
+  - exp must be short (<= hold expiry or <= 24h for cancel/reschedule links)
+- one-time use:
+  - store verify token jti in bookings.verify_token_jti
+  - on confirm, compare and then clear/consume
+- For cancel/reschedule tokens, allow multi-use but include jti and store in a token_consumptions table if one-time is desired; for MVP, require exp short and include booking_id.
+Attendance API:
+- Must require admin API key AND tenant scoping.
+- Admin key stored in env; later replace with proper auth.
+
+# Local dev
+- docker compose: postgres
+- pnpm dev: starts api + web
+- Provide seed script:
+  - create a tenant with slug
+  - create 1–2 salespersons with graph_user_id placeholders
+- Provide "mock mode":
+  - if GRAPH_MOCK=true, return deterministic availability and skip real Graph calls
+  - if ZOOM_MOCK=true, return deterministic join_url
+
+# Tests (minimum)
+- hold idempotency + unique slot conflict
+- confirm saga:
+  - happy path (mock zoom + mock graph)
+  - graph failure triggers compensation record
+- webhook receiver enqueues and returns fast
+
+# README must include
+- Local setup + env vars
+- How to register Entra multi-tenant app and obtain admin consent (high-level steps)
+- How to set application permissions required for Graph
+- Zoom S2S OAuth setup steps (high-level)
+- Azure Container Apps deploy steps:
+  - build/push container
+  - create container app
+  - set env vars
+  - set min replicas=1 for webhook responsiveness
+- Provide an example az CLI snippet or Bicep fragment for min replicas=1.
+
+# Final deliverable rules (strict)
+- Provide repo tree, then all files separated by FILE markers.
+- No missing files. No placeholders like “TODO: implement later” for the required flows; stubs are only allowed for optional parts.

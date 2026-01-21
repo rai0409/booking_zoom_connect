@@ -1,0 +1,63 @@
+You are a senior SaaS engineer. Implement a “commercial MVP-quality” scheduling/booking system in TypeScript. Output MUST be “GitHub-ready”: monorepo, Docker, .env.example, README, Prisma migrations, minimal tests. The output format is strict: repo tree first, then every file in full separated by `FILE: path`. If too large, split into (1/3)(2/3)(3/3) with no missing files.
+
+# Purpose
+Expose multiple salespeople’s Outlook availability to customers. When a customer books (after email verification), the system automatically:
+1) creates a Zoom meeting,
+2) creates an Outlook calendar event (customer as attendee),
+3) sends the meeting invitation email (= booking confirmation).
+Assume frequent manual changes in Outlook; keep synchronization via Microsoft Graph change notifications (webhooks). Persist analytics events (booking completion rate / cancellation rate / attendance rate). Multi-tenant: each customer connects their own Microsoft 365/Entra tenant with admin consent.
+
+# Fixed Requirements (must not change)
+- Cloud: Azure. Deployment target: Azure Container Apps (need min replicas=1 for webhook responsiveness).
+- Backend: Node.js + TypeScript (NestJS preferred).
+- Frontend: Next.js (minimal booking UI).
+- DB: Postgres.
+- Queue: Azure Service Bus in production. Local dev uses in-memory queue (interface swappable).
+- Secrets: Key Vault in prod; local uses .env.
+- Observability: App Insights in prod; local uses console.
+- Microsoft Graph: app-only (application permissions). Multi-tenant app requiring admin consent per tenant.
+- Tenant isolation: single DB with tenant_id column separation.
+- Email sending:
+  - Booking invitation/confirmation = Outlook event created via Graph in salesperson calendar (customer as attendee).
+  - Email verification + auxiliary emails = Graph sendMail from a shared mailbox.
+- Meetings: Zoom (paid assumed). Zoom meetings are created under OUR Zoom org host (customer does not connect their Zoom).
+- Booking finalization: only after customer clicks email verification link.
+- Cancel/reschedule: customer self-service with deadline (default: allowed until 24h before start).
+- Attendance: salesperson records attended/no_show via one-click endpoint (auto meeting logs deferred).
+- Scale: ~15 salespersons, up to 30 bookings/day, peak 10–20/hour, retention 1 year.
+
+# Reliability (critical)
+- Graph webhook must respond quickly: return 200/202 within 10 seconds. Heavy processing MUST be enqueued and processed by a worker.
+- Idempotency: /holds, /confirm, /cancel, /reschedule must support Idempotency-Key header; prevent duplicates via DB unique constraints.
+- Saga/compensation: handle cases like Zoom success but Graph failure. Provide minimal retry + compensation jobs.
+- Throttling: respect Retry-After for Graph 429/503 with exponential backoff and jitter.
+
+# Monorepo
+- /apps/web : Next.js (booking UI)
+- /apps/api : NestJS (REST API + webhook receiver + worker)
+- /packages/shared : DTOs (zod), utils, auth helpers
+- Prisma for schema + migrations.
+- Docker Compose for local Postgres.
+- Use pnpm workspaces + Turbo (or Nx) for dev scripts.
+
+# Multi-tenant onboarding flow (MUST implement, do not leave ambiguous)
+We use ONE multi-tenant Entra application (client_id + client_secret are shared globally; do NOT store per-tenant secrets). For each tenant:
+- `POST /v1/tenants/connect`:
+  - input: { tenant_name, tenant_slug }
+  - creates a tenants row with status="pending"
+  - returns an admin consent URL for Microsoft Entra: /adminconsent?client_id=...&redirect_uri=...&state=...
+- `GET /v1/tenants/callback`:
+  - handles Entra admin consent redirect
+  - reads tenant ID from the callback (store into tenants.m365_tenant_id)
+  - marks tenants.status="active"
+  - also initiates Graph subscriptions creation for all salespersons belonging to this tenant (or provides a job to do so)
+- Token acquisition:
+  - For Graph calls, obtain an app-only token using client_credentials against tenant’s authority using tenants.m365_tenant_id.
+  - Cache tokens in-memory with exp; refresh as needed.
+
+# Tenant model
+- tenants has: id (uuid), name, slug (unique), m365_tenant_id (nullable until connected), status [pending|active|disabled], created_at
+- All API requests must provide tenant context via:
+  - tenant_id in body OR tenant_slug in URL, then resolved to tenant_id, AND checked consistently.
+
+Continue in Part 2 with: data model, state machine, DB constraints/locking, REST API details.

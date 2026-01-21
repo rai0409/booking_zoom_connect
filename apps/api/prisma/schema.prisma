@@ -1,0 +1,254 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TenantStatus {
+  pending
+  active
+  disabled
+}
+
+enum BookingStatus {
+  hold
+  pending_verify
+  confirmed
+  canceled
+  expired
+}
+
+enum MeetingProvider {
+  zoom
+  teams
+}
+
+enum WebhookJobStatus {
+  processing
+  pending
+  done
+  failed
+}
+
+model Tenant {
+  id             String       @id @default(uuid()) @db.Uuid
+  name           String
+  slug           String       @unique
+  m365_tenant_id String?
+  status         TenantStatus @default(pending)
+  created_at     DateTime     @default(now()) @db.Timestamptz(6)
+
+  salespersons   Salesperson[]
+  customers      Customer[]
+  bookings       Booking[]
+  tracking_events TrackingEvent[]
+  audit_logs     AuditLog[]
+  webhook_jobs   WebhookJob[]
+  graph_subscriptions GraphSubscription[]
+  idempotency_keys IdempotencyKey[]
+  compensation_jobs CompensationJob[]
+
+  @@map("tenants")
+}
+
+model Salesperson {
+  id             String     @id @default(uuid()) @db.Uuid
+  tenant_id      String     @db.Uuid
+  graph_user_id  String
+  display_name   String
+  timezone       String
+  active         Boolean    @default(true)
+  created_at     DateTime   @default(now()) @db.Timestamptz(6)
+
+  tenant         Tenant     @relation(fields: [tenant_id], references: [id])
+  bookings       Booking[]
+  webhook_jobs   WebhookJob[]
+  graph_subscriptions GraphSubscription[]
+
+  @@map("salespersons")
+}
+
+model Customer {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenant_id  String   @db.Uuid
+  name       String?
+  email      String
+  company    String?
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+
+  tenant     Tenant   @relation(fields: [tenant_id], references: [id])
+  bookings   Booking[]
+
+  @@unique([tenant_id, email])
+  @@map("customers")
+}
+
+model Booking {
+  id              String        @id @default(uuid()) @db.Uuid
+  tenant_id       String        @db.Uuid
+  salesperson_id  String        @db.Uuid
+  customer_id     String        @db.Uuid
+  start_at_utc    DateTime      @db.Timestamptz(6)
+  end_at_utc      DateTime      @db.Timestamptz(6)
+  status          BookingStatus
+  idempotency_key String
+  verify_token_jti String?
+  customer_reinvite_required Boolean @default(false)
+  customer_notify_required Boolean @default(false)
+  created_at      DateTime      @default(now()) @db.Timestamptz(6)
+  updated_at      DateTime      @updatedAt @db.Timestamptz(6)
+
+  tenant          Tenant        @relation(fields: [tenant_id], references: [id])
+  salesperson     Salesperson   @relation(fields: [salesperson_id], references: [id])
+  customer        Customer      @relation(fields: [customer_id], references: [id])
+  hold            Hold?
+  meeting         Meeting?
+  graph_event     GraphEvent?
+  tracking_events TrackingEvent[]
+  compensation_jobs CompensationJob[]
+
+  @@unique([tenant_id, idempotency_key])
+  @@index([tenant_id, salesperson_id])
+  @@map("bookings")
+}
+
+model Hold {
+  booking_id     String   @id @db.Uuid
+  expires_at_utc DateTime @db.Timestamptz(6)
+
+  booking        Booking  @relation(fields: [booking_id], references: [id])
+
+  @@map("holds")
+}
+
+model Meeting {
+  booking_id          String          @id @db.Uuid
+  provider            MeetingProvider
+  provider_meeting_id String
+  join_url            String
+  start_url           String
+  created_at          DateTime        @default(now()) @db.Timestamptz(6)
+
+  booking             Booking         @relation(fields: [booking_id], references: [id])
+
+  @@map("meetings")
+}
+
+model GraphEvent {
+  booking_id        String   @id @db.Uuid
+  organizer_user_id String
+  event_id          String
+  iCalUId           String
+  etag              String
+  updated_at        DateTime @db.Timestamptz(6)
+
+  booking           Booking  @relation(fields: [booking_id], references: [id])
+
+  @@unique([event_id])
+  @@map("graph_events")
+}
+
+model TrackingEvent {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenant_id       String   @db.Uuid
+  booking_id      String   @db.Uuid
+  type            String
+  occurred_at_utc DateTime @db.Timestamptz(6)
+  meta_json       Json?
+
+  tenant          Tenant   @relation(fields: [tenant_id], references: [id])
+  booking         Booking  @relation(fields: [booking_id], references: [id])
+
+  @@index([tenant_id, booking_id])
+  @@map("tracking_events")
+}
+
+model AuditLog {
+  id             String   @id @default(uuid()) @db.Uuid
+  tenant_id      String   @db.Uuid
+  actor_type     String
+  actor_id       String
+  action         String
+  target_type    String
+  target_id      String
+  meta_json      Json?
+  created_at_utc DateTime @db.Timestamptz(6)
+
+  tenant         Tenant   @relation(fields: [tenant_id], references: [id])
+
+  @@index([tenant_id, target_id])
+  @@map("audit_logs")
+}
+
+model WebhookJob {
+  id              String           @id @default(uuid()) @db.Uuid
+  tenant_id       String           @db.Uuid
+  salesperson_id  String           @db.Uuid
+  subscription_id String
+  change_type     String
+  resource_id     String
+  received_at_utc DateTime         @db.Timestamptz(6)
+  notification_id String?
+  payload         Json
+  status          WebhookJobStatus @default(pending)
+  attempts        Int              @default(0)
+  last_error      String?
+  created_at      DateTime         @default(now()) @db.Timestamptz(6) @map("created_at_utc")
+  updated_at      DateTime         @updatedAt @db.Timestamptz(6) @map("updated_at_utc")
+
+  tenant          Tenant           @relation(fields: [tenant_id], references: [id])
+  salesperson     Salesperson      @relation(fields: [salesperson_id], references: [id])
+
+  @@index([tenant_id, salesperson_id])
+  @@unique([notification_id])
+  @@map("webhook_jobs")
+}
+
+model GraphSubscription {
+  id             String   @id @default(uuid()) @db.Uuid
+  tenant_id      String   @db.Uuid
+  salesperson_id String   @db.Uuid
+  subscription_id String
+  resource       String
+  expires_at DateTime @db.Timestamptz(6) @map("expiration_utc")
+  created_at DateTime @default(now()) @db.Timestamptz(6) @map("created_at_utc")
+  updated_at DateTime @updatedAt @db.Timestamptz(6) @map("updated_at_utc")
+
+  tenant         Tenant   @relation(fields: [tenant_id], references: [id])
+  salesperson    Salesperson @relation(fields: [salesperson_id], references: [id])
+
+  @@unique([tenant_id, salesperson_id])
+  @@unique([subscription_id])
+  @@map("graph_subscriptions")
+}
+
+model IdempotencyKey {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenant_id  String   @db.Uuid
+  scope      String
+  key        String
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+
+  tenant     Tenant   @relation(fields: [tenant_id], references: [id])
+
+  @@unique([tenant_id, scope, key])
+  @@map("idempotency_keys")
+}
+
+model CompensationJob {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenant_id  String   @db.Uuid
+  booking_id String   @db.Uuid
+  status     String
+  reason     String
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+
+  tenant     Tenant   @relation(fields: [tenant_id], references: [id])
+  booking    Booking  @relation(fields: [booking_id], references: [id])
+
+  @@index([tenant_id, booking_id])
+  @@map("compensation_jobs")
+}
