@@ -7,3 +7,6 @@ pnpm-lock.yaml
 apps/api/dist
 apps/api/prisma/dev.db
 apps/api/.env
+
+# Turborepo cache
+.turbo/
