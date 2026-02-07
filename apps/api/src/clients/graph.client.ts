@@ -53,10 +53,11 @@ export class GraphClient {
     throw new Error("Graph client not implemented");
   }
 
-  async deleteEvent(): Promise<void> {
+  async deleteEvent(eventId: string): Promise<void> {
     if (config.graphMock) {
       return;
     }
+    void eventId;
     throw new Error("Graph client not implemented");
   }
 

@@ -26,10 +26,11 @@ export class ZoomClient {
     throw new Error("Zoom client not implemented");
   }
 
-  async deleteMeeting(): Promise<void> {
+  async deleteMeeting(meetingId: string): Promise<void> {
     if (config.zoomMock) {
       return;
     }
+    void meetingId;
     throw new Error("Zoom client not implemented");
   }
 }
