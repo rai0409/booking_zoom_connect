@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+jobs:
+  test-api:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: booking
+          POSTGRES_PASSWORD: booking
+          POSTGRES_DB: booking
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U booking -d booking"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      DATABASE_URL: postgresql://booking:booking@localhost:5432/booking?schema=public
+      NODE_ENV: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Prisma validate
+        working-directory: apps/api
+        run: pnpm exec prisma validate
+
+      - name: Wait for Postgres
+        run: |
+          for i in {1..30}; do
+            (echo > /dev/tcp/127.0.0.1/5432) >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "Postgres not ready" >&2
+          exit 1
+
+      - name: Apply migrations (deploy)
+        working-directory: apps/api
+        run: pnpm exec prisma migrate deploy
+
+      - name: Generate Prisma Client
+        working-directory: apps/api
+        run: pnpm exec prisma generate
+
+      - name: Run tests
+        working-directory: apps/api
+        run: pnpm test -- --runInBand
