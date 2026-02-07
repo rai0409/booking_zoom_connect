@@ -109,7 +109,8 @@ describe("BookingService", () => {
     );
 
     const verify = await service.sendVerification("acme", booking.id, "idem-verify");
-    const confirmed = await service.confirmBooking("acme", verify.token, "idem-confirm");
+    expect(verify.token).toBeTruthy();
+    const confirmed = await service.confirmBooking("acme", verify.token!, "idem-confirm");
 
     const refreshed = await prisma.booking.findUnique({ where: { id: booking.id } });
     expect(refreshed?.status).toEqual(BookingStatus.confirmed);
@@ -133,14 +134,15 @@ describe("BookingService", () => {
         throw new Error("graph down");
       },
       sendMail: async () => {},
-      deleteEvent: async () => {}
+      deleteEvent: async (_eventId: string) => {}
     };
     (service as any).zoom = {
       createMeeting: async () => ({ meetingId: "m1", joinUrl: "j1", startUrl: "s1" }),
-      deleteMeeting: async () => {}
+      deleteMeeting: async (_meetingId: string) => {}
     };
 
-    await expect(service.confirmBooking("acme", verify2.token, "idem-confirm-2")).rejects.toThrow();
+    expect(verify2.token).toBeTruthy();
+    await expect(service.confirmBooking("acme", verify2.token!, "idem-confirm-2")).rejects.toThrow();
 
     const compensation = await prisma.compensationJob.findFirst({
       where: { booking_id: booking2.id, tenant_id: tenant!.id }

@@ -133,7 +133,8 @@ export class BookingService {
       include: { hold: true, customer: true }
     });
     if (!booking || !booking.hold) throw new NotFoundException("Booking not found");
-    if (![BookingStatus.hold, BookingStatus.pending_verify].includes(booking.status)) {
+    const allowedStatuses: BookingStatus[] = [BookingStatus.hold, BookingStatus.pending_verify];
+    if (!allowedStatuses.includes(booking.status)) {
       throw new ConflictException("Invalid booking state");
     }
 
@@ -215,6 +216,8 @@ export class BookingService {
         endUtc: endIso,
         timezone: booking.salesperson.timezone
       });
+      const zm = zoomMeeting;
+      if (!zm) throw new Error("zoomMeeting unexpectedly null");
 
       const graphEvent = await this.graph.createEvent({
         organizerUserId: booking.salesperson.graph_user_id,
@@ -223,7 +226,7 @@ export class BookingService {
         endUtc: endIso,
         timezone: booking.salesperson.timezone,
         attendeeEmail: booking.customer.email,
-        body: `Join URL: ${zoomMeeting.joinUrl}`
+        body: `Join URL: ${zm.joinUrl}`
       });
 
       const result = await prisma.$transaction(async (tx) => {
@@ -236,9 +239,9 @@ export class BookingService {
           data: {
             booking_id: booking.id,
             provider: "zoom",
-            provider_meeting_id: zoomMeeting.meetingId,
-            join_url: zoomMeeting.joinUrl,
-            start_url: zoomMeeting.startUrl
+            provider_meeting_id: zm.meetingId,
+            join_url: zm.joinUrl,
+            start_url: zm.startUrl
           }
         });
 
@@ -275,7 +278,7 @@ export class BookingService {
           }
         });
         try {
-          await this.zoom.deleteMeeting();
+          await this.zoom.deleteMeeting(zoomMeeting.meetingId);
         } catch {
           // ignore
         }
@@ -294,7 +297,7 @@ export class BookingService {
 
     const booking = await prisma.booking.findFirst({
       where: { id: bookingId, tenant_id: tenant.id },
-      include: { meeting: true, graph_event: true }
+      include: { meeting: true, graph_event: true },
     });
     if (!booking) throw new NotFoundException("Booking not found");
     if (booking.status === BookingStatus.canceled) return { status: "canceled" };
@@ -309,8 +312,12 @@ export class BookingService {
     if (existing) return { status: "canceled" };
 
     await prisma.booking.update({ where: { id: booking.id }, data: { status: BookingStatus.canceled } });
-    await this.graph.deleteEvent();
-    await this.zoom.deleteMeeting();
+    if (booking.graph_event) {
+      await this.graph.deleteEvent(booking.graph_event.event_id);
+    }
+    if (booking.meeting) {
+      await this.zoom.deleteMeeting(booking.meeting.provider_meeting_id);
+    }
     await this.recordIdempotency(tenant.id, "cancel", idempotencyKey);
 
     return { status: "canceled" };

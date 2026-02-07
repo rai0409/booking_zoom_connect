@@ -3,7 +3,6 @@ node_modules
 .next
 .dist
 coverage
-pnpm-lock.yaml
 apps/api/dist
 apps/api/prisma/dev.db
 apps/api/.env
@@ -42,4 +41,3 @@ build/
 Thumbs.db
 .vscode/
 .idea/
-
