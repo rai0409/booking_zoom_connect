@@ -4,6 +4,7 @@ import { DateTime } from "luxon";
 import { BookingStatus } from "@prisma/client";
 
 const service = new BookingService();
+const ORIGINAL_GRAPH_ENABLED = process.env.GRAPH_ENABLED;
 
 async function resetDb() {
   await prisma.$executeRawUnsafe(`
@@ -45,6 +46,11 @@ describe("BookingService", () => {
 
   afterAll(async () => {
     await prisma.$disconnect();
+    if (ORIGINAL_GRAPH_ENABLED === undefined) {
+      delete process.env.GRAPH_ENABLED;
+    } else {
+      process.env.GRAPH_ENABLED = ORIGINAL_GRAPH_ENABLED;
+    }
   });
 
   test("hold idempotency and slot conflict", async () => {
@@ -97,6 +103,7 @@ describe("BookingService", () => {
     const start = DateTime.utc().plus({ hours: 4 }).toISO();
     const end = DateTime.utc().plus({ hours: 5 }).toISO();
 
+    process.env.GRAPH_ENABLED = "1";
     const booking = await service.createHold(
       "acme",
       {
@@ -143,9 +150,12 @@ describe("BookingService", () => {
     const deleteMeeting = jest.fn(async (..._args: any[]) => {});
     (service as any).zoom = { createMeeting, deleteMeeting };
 
-    const confirmed2 = await service.confirmBooking("acme", verify2.token!, "idem-confirm-2");
-    expect(confirmed2).toBeTruthy();
-    expect(confirmed2!.status).toEqual(BookingStatus.confirmed);
+    await expect(
+      service.confirmBooking("acme", verify2.token!, "idem-confirm-2")
+    ).rejects.toThrow();
+
+    expect(createEvent).toHaveBeenCalled();
+
     const compensation = await prisma.compensationJob.findFirst({
       where: { booking_id: booking2.id, tenant_id: tenant!.id }
     });
@@ -154,7 +164,6 @@ describe("BookingService", () => {
       return;
     }
 
-    expect(createEvent).toHaveBeenCalled();
     expect(compensation).toBeTruthy();
   });
 });
