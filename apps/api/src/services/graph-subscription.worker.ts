@@ -4,16 +4,23 @@ import { DateTime } from "luxon";
 import { prisma } from "../prisma";
 import { GraphClient } from "../clients/graph.client";
 import { TenantStatus } from "@prisma/client";
+import { randomSecret } from "../utils/crypto";
 
 const RENEWAL_THRESHOLD_MINUTES = 30;
-const SUBSCRIPTION_DURATION_HOURS = 12;
+const SUBSCRIPTION_DURATION_HOURS = 48;
 
 @Injectable()
 export class GraphSubscriptionWorker {
-  private graph = new GraphClient();
+  private graph: GraphClient | null = null;
+  private getGraph() {
+    if (!this.graph) this.graph = new GraphClient();
+    return this.graph;
+  }
 
   @Interval(60_000)
   async ensureSubscriptions() {
+    if (process.env.GRAPH_ENABLED === "0") return;
+    const graph = this.getGraph();
     const salespersons = await prisma.salesperson.findMany({
       where: { active: true },
       include: { tenant: true }
@@ -28,7 +35,7 @@ export class GraphSubscriptionWorker {
         continue;
       }
 
-      const resource = `/users/${salesperson.graph_user_id}/events`;
+      const resource = `users/${salesperson.graph_user_id}/events`;
       const existing = await prisma.graphSubscription.findFirst({
         where: {
           tenant_id: salesperson.tenant_id,
@@ -37,25 +44,32 @@ export class GraphSubscriptionWorker {
       });
 
       if (!existing) {
-        const created = await this.graph.createSubscription({
-          resource,
-          expirationUtc: desiredExpiration.toISO() || ""
-        });
+        const clientState = randomSecret();
+        const created = await graph.createSubscription(
+          salesperson.tenant.m365_tenant_id || "",
+          {
+            resource,
+            expirationUtc: desiredExpiration.toISO() || "",
+            clientState
+          }
+        );
 
-        await prisma.graphSubscription.create({
+        await (prisma.graphSubscription as any).create({
           data: {
             tenant_id: salesperson.tenant_id,
             salesperson_id: salesperson.id,
             subscription_id: created.subscriptionId,
             resource,
-            expires_at: DateTime.fromISO(created.expiresAtUtc, { zone: "utc" }).toJSDate()
+            expires_at: DateTime.fromISO(created.expiresAtUtc, { zone: "utc" }).toJSDate(),
+            clientState
           }
         });
         continue;
       }
 
       if (DateTime.fromJSDate(existing.expires_at) < renewalCutoff) {
-        const renewed = await this.graph.renewSubscription(
+        const renewed = await graph.renewSubscription(
+          salesperson.tenant.m365_tenant_id || "",
           existing.subscription_id,
           desiredExpiration.toISO() || ""
         );
