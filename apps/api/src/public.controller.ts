@@ -1,9 +1,9 @@
-import { Body, Controller, Get, Headers, Param, Post, Query } from "@nestjs/common";
+import { Body, Controller, Get, Headers, Inject, Param, Post, Query } from "@nestjs/common";
 import { BookingService } from "./services/booking.service";
 
 @Controller("/v1/public")
 export class PublicController {
-  constructor(private readonly bookingService: BookingService) {}
+  constructor(@Inject(BookingService) private readonly bookingService: BookingService) {}
 
   @Get(":tenantSlug/availability")
   async availability(

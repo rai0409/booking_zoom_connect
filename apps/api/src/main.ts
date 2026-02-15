@@ -1,4 +1,11 @@
 import "reflect-metadata";
+import { randomUUID } from "node:crypto";
+
+const g = globalThis as any;
+if (!g.crypto) g.crypto = {};
+if (typeof g.crypto.randomUUID !== "function") {
+  g.crypto.randomUUID = randomUUID;
+}
 import { NestFactory } from "@nestjs/core";
 import { AppModule } from "./app.module";
 import * as dotenv from "dotenv";
