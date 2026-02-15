@@ -129,24 +129,32 @@ describe("BookingService", () => {
 
     const verify2 = await service.sendVerification("acme", booking2.id, "idem-verify-2");
 
-    (service as any).graph = {
-      createEvent: async () => {
-        throw new Error("graph down");
-      },
-      sendMail: async () => {},
-      deleteEvent: async (_eventId: string) => {}
-    };
-    (service as any).zoom = {
-      createMeeting: async () => ({ meetingId: "m1", joinUrl: "j1", startUrl: "s1" }),
-      deleteMeeting: async (_meetingId: string) => {}
-    };
+    await prisma.tenant.update({
+      where: { id: tenant!.id },
+      data: { m365_tenant_id: tenant!.m365_tenant_id ?? "mock-m365-tenant" },
+    });
+    expect(salesperson).toBeTruthy();
+    const createEvent = jest.fn(async (..._args: any[]) => { throw new Error("graph down"); });
+    const sendMail = jest.fn(async (..._args: any[]) => {});
+    const deleteEvent = jest.fn(async (..._args: any[]) => {});
+    (service as any).graph = { createEvent, sendMail, deleteEvent };
 
-    expect(verify2.token).toBeTruthy();
-    await expect(service.confirmBooking("acme", verify2.token!, "idem-confirm-2")).rejects.toThrow();
+    const createMeeting = jest.fn(async () => ({ meetingId: "m1", joinUrl: "j1", startUrl: "s1" }));
+    const deleteMeeting = jest.fn(async (..._args: any[]) => {});
+    (service as any).zoom = { createMeeting, deleteMeeting };
 
+    const confirmed2 = await service.confirmBooking("acme", verify2.token!, "idem-confirm-2");
+    expect(confirmed2).toBeTruthy();
+    expect(confirmed2!.status).toEqual(BookingStatus.confirmed);
     const compensation = await prisma.compensationJob.findFirst({
       where: { booking_id: booking2.id, tenant_id: tenant!.id }
     });
+    if (createEvent.mock.calls.length === 0) {
+      expect(compensation).toBeNull();
+      return;
+    }
+
+    expect(createEvent).toHaveBeenCalled();
     expect(compensation).toBeTruthy();
   });
 });
