@@ -2,174 +2,153 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+API_DIR="$ROOT/apps/api"
+LOG_FILE="${LOG_FILE:-/tmp/api-dev.log}"
+BASE_URL="${BASE_URL:-http://localhost:4000}"
 
 require() { command -v "$1" >/dev/null 2>&1 || { echo "missing command: $1" >&2; exit 1; }; }
-require docker
 require curl
-require jq
 require pnpm
 require python3
 require psql
-require ss
-require ps
-require awk
-require sed
-require grep
+# docker は必須ではないが、あるなら確認する
+command -v docker >/dev/null 2>&1 && HAS_DOCKER=1 || HAS_DOCKER=0
 
-# load .env if exists
-if [[ -f "$ROOT/.env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "$ROOT/.env"
-  set +a
-fi
-
-BASE_URL="${BASE_URL:-http://localhost:4000}"
-PORT="${PORT:-4000}"
-
-# must inject
-export GRAPH_ENABLED=0
-export EXPIRY_WORKER_ENABLED=0
-
-docker info >/dev/null 2>&1 || { echo "Docker daemon not reachable. Start Docker Desktop." >&2; exit 1; }
-[[ -n "${DATABASE_URL:-}" ]] || { echo "DATABASE_URL is not set." >&2; exit 1; }
-
-find_pids_on_port() {
-  local port="$1"
-  ss -ltnp | awk -v p=":${port}" '
-    $4 ~ p {
-      if (match($0, /pid=([0-9]+)/, m)) print m[1];
-    }
-  ' | sort -u
-}
-
-kill_listeners_on_port() {
-  local port="$1"
-  local pids cmd
-  pids="$(find_pids_on_port "$port" || true)"
-  [[ -z "${pids:-}" ]] && return 0
-
-  echo "[dev-up] port ${port} is in use. checking owners..."
-  for p in $pids; do
-    cmd="$(ps -p "$p" -o cmd= 2>/dev/null || true)"
-    echo "[dev-up] pid=$p cmd=$cmd"
-    # 誤kill防止：自分のアプリっぽい時だけ落とす
-    echo "$cmd" | grep -Eq "booking_zoom_connect|apps/api|tsx watch|@booking/api" || {
-      echo "[dev-up] refusing to kill pid=$p (not recognized as this app)" >&2
-      echo "[dev-up] please free :${port} manually or set PORT/BASE_URL" >&2
-      exit 1
-    }
-  done
-
-  echo "[dev-up] stopping existing listener(s) on :${port}..."
-  kill $pids || true
-  for _ in $(seq 1 20); do
-    if ! ss -ltnp | grep -q ":${port}"; then
-      echo "[dev-up] :${port} freed"
-      return 0
+detect_host_ip() {
+  # 1) host.docker.internal が引けるならそれ
+  if command -v getent >/dev/null 2>&1; then
+    if getent hosts host.docker.internal >/dev/null 2>&1; then
+      getent hosts host.docker.internal | awk '{print $1; exit}'
+      return
     fi
-    sleep 0.2
-  done
-  kill -9 $pids || true
-  ss -ltnp | grep -q ":${port}" && { echo "[dev-up] failed to free :${port}" >&2; exit 1; }
-  echo "[dev-up] :${port} freed"
+  fi
+  # 2) default gateway（WSL→Windows の経路でだいたいこれ）
+  if command -v ip >/dev/null 2>&1; then
+    ip route | awk '/^default/ {print $3; exit}'
+    return
+  fi
+  # 3) resolv.conf nameserver fallback
+  awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf
 }
 
-detect_wsl_host_ip() { ip route | awk '/default/ {print $3; exit}'; }
-
-rewrite_db_host() {
-  local url="$1" host="$2"
-  python3 - <<'PY' "$url" "$host"
-import sys
+rewrite_db_url_host_if_localhost() {
+  local host_ip="$1"
+  python3 - <<'PY' "$host_ip"
+import os, sys
 from urllib.parse import urlparse, urlunparse
-url=sys.argv[1]; host=sys.argv[2]
-u=urlparse(url)
-netloc=u.netloc
-if "@" in netloc:
-  auth, rest = netloc.split("@", 1)
-else:
-  auth, rest = "", netloc
-if ":" in rest:
-  _, port = rest.rsplit(":", 1)
-  rest = f"{host}:{port}"
-else:
-  rest = host
-netloc = f"{auth}@{rest}" if auth else rest
-print(urlunparse((u.scheme, netloc, u.path, u.params, u.query, u.fragment)))
+
+host_ip = sys.argv[1]
+url = os.environ.get("DATABASE_URL","").strip()
+if not url:
+    print("", end="")
+    sys.exit(0)
+
+u = urlparse(url)
+# Only rewrite if host is localhost/127.0.0.1
+hostname = u.hostname or ""
+if hostname not in ("localhost", "127.0.0.1"):
+    print(url, end="")
+    sys.exit(0)
+
+port = f":{u.port}" if u.port else ""
+userinfo = ""
+if u.username:
+    userinfo = u.username
+    if u.password:
+        userinfo += f":{u.password}"
+    userinfo += "@"
+
+netloc = f"{userinfo}{host_ip}{port}"
+new_u = u._replace(netloc=netloc)
+print(urlunparse(new_u), end="")
 PY
 }
 
-strip_schema_query() { echo "${1%%\?schema=*}"; }
-test_psql() { psql "$1" -c "select 1;" >/dev/null 2>&1; }
-
-HOST_IP="$(detect_wsl_host_ip || true)"
-candidates=("127.0.0.1" "host.docker.internal")
-[[ -n "${HOST_IP:-}" ]] && candidates+=("$HOST_IP")
-
-ORIG_URL="$DATABASE_URL"
-SELECTED_URL=""
-for h in "${candidates[@]}"; do
-  u="$(rewrite_db_host "$ORIG_URL" "$h")"
-  u_noschema="$(strip_schema_query "$u")"
-  if test_psql "$u_noschema"; then
-    SELECTED_URL="$u"
-    echo "[dev-up] db ok via host=$h"
-    break
-  else
-    echo "[dev-up] db ng via host=$h"
+docker_db_check() {
+  if [[ "$HAS_DOCKER" -ne 1 ]]; then
+    echo "[dev-up] docker not found; skip docker ps check" >&2
+    return 0
   fi
-done
+  echo "[dev-up] docker ps (ports contains 5432?):" >&2
+  docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}' | sed -n '1,120p' >&2
+}
 
-[[ -n "$SELECTED_URL" ]] || { echo "Cannot connect to Postgres from WSL." >&2; exit 1; }
-export DATABASE_URL="$SELECTED_URL"
+wait_http_200() {
+  local url="$1"
+  local name="$2"
+  for i in $(seq 1 60); do
+    if curl -fsS "$url" >/dev/null 2>&1; then
+      echo "[dev-up] OK: $name" >&2
+      return 0
+    fi
+    sleep 1
+  done
+  echo "[dev-up] FAIL: $name did not become ready: $url" >&2
+  return 1
+}
 
-# 二重起動対策（ここが今回のEADDRINUSEの根治）
-kill_listeners_on_port "$PORT"
+db_check() {
+  local dburl="$1"
+  local base="${dburl%%\?schema=*}"
+  psql "$base" -c "select 1;" >/dev/null
+}
 
-echo "[dev-up] prisma migrate deploy"
-( cd "$ROOT/apps/api" && pnpm -s prisma migrate deploy ) || { echo "[dev-up] migrate deploy failed" >&2; exit 1; }
+main() {
+  [[ -d "$API_DIR" ]] || { echo "missing dir: $API_DIR" >&2; exit 1; }
 
-LOG_FILE="/tmp/api-dev.log"
-echo "[dev-up] start API -> $LOG_FILE"
+  docker_db_check
 
-(
-  cd "$ROOT"
-  pnpm -C apps/api dev
-) 2>&1 | tee "$LOG_FILE" &
-API_PIPE_PID=$!
-
-# pipeline全体を止める（teeだけ殺してnodeが残るのを防ぐ）
-API_PGID="$(ps -o pgid= "$API_PIPE_PID" | tr -d ' ')"
-trap 'kill -- -"$API_PGID" >/dev/null 2>&1 || true' EXIT INT TERM
-
-echo "[dev-up] wait /health 200..."
-for i in $(seq 1 60); do
-  if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
-    echo "[dev-up] /health ok"
-    break
+  # Load .env if exists (so DATABASE_URL/JWT_SECRET etc are present)
+  if [[ -f "$API_DIR/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$API_DIR/.env"
+    set +a
   fi
-  sleep 1
-  kill -0 "$API_PIPE_PID" >/dev/null 2>&1 || { echo "API exited. See $LOG_FILE" >&2; exit 1; }
-done
 
-echo "[dev-up] wait /ready 200..."
-for i in $(seq 1 60); do
-  if curl -fsS "$BASE_URL/ready" >/dev/null 2>&1; then
-    echo "[dev-up] /ready ok"
-    break
+  # Inject fixed toggles (MVP stability)
+  export GRAPH_ENABLED="${GRAPH_ENABLED:-0}"
+  export EXPIRY_WORKER_ENABLED="${EXPIRY_WORKER_ENABLED:-0}"
+
+  # Detect host ip and rewrite DATABASE_URL if it points to localhost
+  HOST_IP="${HOST_IP:-$(detect_host_ip)}"
+  if [[ -n "${DATABASE_URL:-}" && -n "$HOST_IP" ]]; then
+    NEW_DB="$(rewrite_db_url_host_if_localhost "$HOST_IP")"
+    if [[ -n "$NEW_DB" && "$NEW_DB" != "$DATABASE_URL" ]]; then
+      export DATABASE_URL="$NEW_DB"
+      echo "[dev-up] DATABASE_URL rewritten to use HOST_IP=$HOST_IP" >&2
+    fi
   fi
-  sleep 1
-  kill -0 "$API_PIPE_PID" >/dev/null 2>&1 || { echo "API exited. See $LOG_FILE" >&2; exit 1; }
-done
 
-if ! curl -fsS "$BASE_URL/ready" >/dev/null 2>&1; then
-  echo "[dev-up] /ready not OK. details:" >&2
-  curl -sS "$BASE_URL/ready" | jq . >&2 || true
-  exit 1
-fi
+  : "${DATABASE_URL:?DATABASE_URL is required (set in apps/api/.env or env)}"
 
-DB_NOSCHEMA="$(strip_schema_query "$DATABASE_URL")"
-psql "$DB_NOSCHEMA" -c "select 1;" >/dev/null
-echo "[dev-up] startup OK (health + ready + db)"
+  # Start API in background, tee logs to fixed location
+  echo "[dev-up] starting API (logs -> $LOG_FILE)" >&2
+  rm -f "$LOG_FILE"
+  (
+    cd "$API_DIR"
+    pnpm -s dev
+  ) 2>&1 | tee "$LOG_FILE" &
+  API_PID=$!
 
-wait "$API_PIPE_PID"
+  cleanup() {
+    if kill -0 "$API_PID" >/dev/null 2>&1; then
+      kill "$API_PID" >/dev/null 2>&1 || true
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  # Readiness checks
+  wait_http_200 "$BASE_URL/health" "/health"
+  wait_http_200 "$BASE_URL/ready"  "/ready"
+  db_check "$DATABASE_URL"
+  echo "[dev-up] OK: DB select 1" >&2
+
+  echo "[dev-up] dev-up completed; API running (pid=$API_PID)" >&2
+  echo "[dev-up] tail logs: tail -n 200 $LOG_FILE" >&2
+
+  # Keep foreground attached
+  wait "$API_PID"
+}
+
+main "$@"

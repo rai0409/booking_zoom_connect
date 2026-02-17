@@ -11,7 +11,12 @@ export class PublicController {
     @Query("salesperson") salespersonId: string,
     @Query("date") date: string
   ) {
-    return this.bookingService.getAvailability(tenantSlug, salespersonId, date);
+    return this.bookingService.getAvailabilityPublic(tenantSlug, salespersonId, date);
+  }
+
+  @Get(":tenantSlug/salespersons")
+  async salespersons(@Param("tenantSlug") tenantSlug: string) {
+    return this.bookingService.listSalespersonsPublic(tenantSlug);
   }
 
   @Post(":tenantSlug/holds")
@@ -25,7 +30,7 @@ export class PublicController {
       customer: { email: string; name?: string; company?: string };
     }
   ) {
-    return this.bookingService.createHold(tenantSlug, body, idempotencyKey);
+    return this.bookingService.createHoldPublic(tenantSlug, body, idempotencyKey);
   }
 
   @Post(":tenantSlug/auth/verify-email")
@@ -34,7 +39,7 @@ export class PublicController {
     @Headers("Idempotency-Key") idempotencyKey: string,
     @Body() body: { booking_id: string }
   ) {
-    return this.bookingService.sendVerification(tenantSlug, body.booking_id, idempotencyKey);
+    return this.bookingService.sendVerificationPublic(tenantSlug, body.booking_id, idempotencyKey);
   }
 
   @Post(":tenantSlug/confirm")
@@ -43,7 +48,7 @@ export class PublicController {
     @Headers("Idempotency-Key") idempotencyKey: string,
     @Body() body: { token: string }
   ) {
-    return this.bookingService.confirmBooking(tenantSlug, body.token, idempotencyKey);
+    return this.bookingService.confirmBookingPublic(tenantSlug, body.token, idempotencyKey);
   }
 
   @Post(":tenantSlug/bookings/:id/cancel")
@@ -53,7 +58,7 @@ export class PublicController {
     @Headers("Idempotency-Key") idempotencyKey: string,
     @Body() body: { token: string }
   ) {
-    return this.bookingService.cancelBooking(tenantSlug, bookingId, body.token, idempotencyKey);
+    return this.bookingService.cancelBookingPublic(tenantSlug, bookingId, body.token, idempotencyKey);
   }
 
   @Post(":tenantSlug/bookings/:id/reschedule")
@@ -63,7 +68,7 @@ export class PublicController {
     @Headers("Idempotency-Key") idempotencyKey: string,
     @Body() body: { token: string; new_start_at: string; new_end_at: string }
   ) {
-    return this.bookingService.rescheduleBooking(tenantSlug, bookingId, body.token, {
+    return this.bookingService.rescheduleBookingPublic(tenantSlug, bookingId, body.token, {
       new_start_at: body.new_start_at,
       new_end_at: body.new_end_at
     }, idempotencyKey);
