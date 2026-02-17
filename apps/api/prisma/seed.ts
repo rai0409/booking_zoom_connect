@@ -36,6 +36,13 @@ async function main() {
 
 main()
   .then(async () => {
+
+  // Ensure dev tenant is public-enabled for public booking (runs after migrate reset)
+  await prisma.tenant.updateMany({
+    where: { slug: "acme" },
+    data: { public_booking_enabled: true, public_timezone: "Asia/Tokyo" }
+  });
+
     await prisma.$disconnect();
   })
   .catch(async (err) => {

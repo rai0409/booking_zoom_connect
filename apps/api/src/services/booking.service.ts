@@ -13,11 +13,95 @@ const CANCEL_DEADLINE_HOURS = 24;
 
 type AvailabilitySlot = { start_at_utc: string; end_at_utc: string };
 
+type PublicHoldResponse = {
+  id: string;
+  status: BookingStatus;
+  start_at_utc: string;
+  end_at_utc: string;
+  hold: { expires_at_utc: string } | null;
+};
+
+type PublicSalesperson = { id: string; display_name: string; timezone: string };
+
 @Injectable()
 export class BookingService {
   private graph = new GraphClient();
   private zoom = new ZoomClient();
   private availabilityCache = new Map<string, { expiresAt: number; slots: AvailabilitySlot[] }>();
+
+  // ---- Public boundary (tenant gate) ----
+  private async getPublicTenantOrThrow(tenantSlug: string) {
+    const tenant = await prisma.tenant.findUnique({
+      where: { slug: tenantSlug },
+      select: { id: true, public_booking_enabled: true }
+    });
+    // Boundary: if disabled, behave as not found (do not leak existence)
+    if (!tenant || !tenant.public_booking_enabled) throw new NotFoundException("Tenant not found");
+    return tenant;
+  }
+
+  async getAvailabilityPublic(tenantSlug: string, salespersonId: string, date: string) {
+    await this.getPublicTenantOrThrow(tenantSlug);
+    return this.getAvailability(tenantSlug, salespersonId, date);
+  }
+
+  async listSalespersonsPublic(tenantSlug: string): Promise<PublicSalesperson[]> {
+    const tenant = await this.getPublicTenantOrThrow(tenantSlug);
+    return prisma.salesperson.findMany({
+      where: { tenant_id: tenant.id, active: true },
+      orderBy: { display_name: "asc" },
+      select: { id: true, display_name: true, timezone: true }
+    });
+  }
+
+  async createHoldPublic(
+    tenantSlug: string,
+    payload: {
+      salesperson_id: string;
+      start_at: string;
+      end_at: string;
+      customer: { email: string; name?: string; company?: string };
+    },
+    idempotencyKey: string
+  ): Promise<PublicHoldResponse> {
+    await this.getPublicTenantOrThrow(tenantSlug);
+    const booking = await this.createHold(tenantSlug, payload, idempotencyKey);
+    return {
+      id: booking.id,
+      status: booking.status,
+      start_at_utc: toIsoUtc(booking.start_at_utc),
+      end_at_utc: toIsoUtc(booking.end_at_utc),
+      hold: booking.hold ? { expires_at_utc: toIsoUtc(booking.hold.expires_at_utc) } : null
+    };
+  }
+
+  async sendVerificationPublic(tenantSlug: string, bookingId: string, idempotencyKey: string) {
+    await this.getPublicTenantOrThrow(tenantSlug);
+    return this.sendVerification(tenantSlug, bookingId, idempotencyKey);
+  }
+
+  async confirmBookingPublic(tenantSlug: string, token: string, idempotencyKey: string) {
+    await this.getPublicTenantOrThrow(tenantSlug);
+    const booking = await this.confirmBooking(tenantSlug, token, idempotencyKey);
+    if (!booking) throw new NotFoundException("Booking not found");
+    return { status: "confirmed", booking_id: booking.id };
+  }
+
+  async cancelBookingPublic(tenantSlug: string, bookingId: string, token: string, idempotencyKey: string) {
+    await this.getPublicTenantOrThrow(tenantSlug);
+    return this.cancelBooking(tenantSlug, bookingId, token, idempotencyKey);
+  }
+
+  async rescheduleBookingPublic(
+    tenantSlug: string,
+    bookingId: string,
+    token: string,
+    payload: { new_start_at: string; new_end_at: string },
+    idempotencyKey: string
+  ) {
+    await this.getPublicTenantOrThrow(tenantSlug);
+    return this.rescheduleBooking(tenantSlug, bookingId, token, payload, idempotencyKey);
+  }
 
   private verifyBookingTokenOrThrow(token: string, expiredMsg = "token expired") {
     try {

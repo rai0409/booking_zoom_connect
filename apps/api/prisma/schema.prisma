@@ -39,6 +39,10 @@ model Tenant {
   slug           String       @unique
   m365_tenant_id String?
   status         TenantStatus @default(pending)
+  // Public booking settings (public API boundary)
+  public_booking_enabled Boolean @default(false)
+  public_timezone        String  @default("Asia/Tokyo")
+  public_business_hours  Json?
   created_at     DateTime     @default(now()) @db.Timestamptz(6)
 
   salespersons        Salesperson[]
@@ -205,6 +209,11 @@ model WebhookJob {
   @@unique([notification_id])
   @@index([tenant_id, salesperson_id])
   @@map("webhook_jobs")
+  dedupe_key String? @unique
+  next_run_at_utc DateTime? @db.Timestamptz(6)
+  processing_started_at_utc DateTime? @db.Timestamptz(6)
+  raw_notification Json?
+  @@index([status, next_run_at_utc])
 }
 
 model GraphSubscription {
@@ -223,6 +232,7 @@ model GraphSubscription {
   @@unique([tenant_id, salesperson_id])
   @@unique([subscription_id])
   @@map("graph_subscriptions")
+  client_state String?
 }
 
 model IdempotencyKey {

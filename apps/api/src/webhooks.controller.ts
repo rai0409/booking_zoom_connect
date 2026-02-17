@@ -82,10 +82,10 @@ export class WebhooksController {
             received_at_utc: new Date(payload.received_at_utc),
             notification_id: notification.id,
             payload,
-            dedupeKey: notification.id
+            dedupe_key: notification.id
               ? `graph:${subscriptionId}:${notification.id}`
               : `graph:${subscriptionId}:${resourceId}:${changeType}`,
-            nextRunAt: new Date(),
+            next_run_at_utc: new Date(),
           }
         });
 

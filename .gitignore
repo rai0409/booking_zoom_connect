@@ -44,3 +44,8 @@ Thumbs.db
 
 # local logs
 apps/api/*.log
+
+# editor swap
+*.swp
+*.swo
+*.swx
