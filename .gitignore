@@ -49,3 +49,6 @@ apps/api/*.log
 *.swp
 *.swo
 *.swx
+
+# Next.js/TS build cache
+apps/web/tsconfig.tsbuildinfo
