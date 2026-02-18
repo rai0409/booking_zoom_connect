@@ -1,0 +1,5 @@
+{
+  "message": "Idempotency-Key required",
+  "error": "Bad Request",
+  "statusCode": 400
+}
