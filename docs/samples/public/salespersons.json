@@ -1,0 +1,22 @@
+[
+  {
+    "id": "b806673d-144e-448d-ab4f-ce91885f48e8",
+    "display_name": "Alex Doe",
+    "timezone": "Asia/Tokyo"
+  },
+  {
+    "id": "da3f1fcf-2b9f-43cc-92cc-18870dca1d2e",
+    "display_name": "Alex Doe",
+    "timezone": "Asia/Tokyo"
+  },
+  {
+    "id": "fd7cb713-9b0f-4262-b69b-63b948e319a2",
+    "display_name": "Riley Kim",
+    "timezone": "Asia/Tokyo"
+  },
+  {
+    "id": "3517c9ac-c27d-4ffa-8303-255767c3c431",
+    "display_name": "Riley Kim",
+    "timezone": "Asia/Tokyo"
+  }
+]
