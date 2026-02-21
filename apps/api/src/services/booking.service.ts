@@ -1,6 +1,7 @@
 import { Injectable, BadRequestException, ConflictException, ForbiddenException, NotFoundException, UnauthorizedException } from "@nestjs/common";
 import { Prisma, BookingStatus } from "@prisma/client";
 import { GraphClient } from "../clients/graph.client";
+import { config } from "../config";
 import { ZoomClient } from "../clients/zoom.client";
 import { prisma } from "../prisma";
 import { parseIsoToUtc, utcNow, toIsoUtc, dateFromYmdLocal } from "../utils/time";
@@ -28,6 +29,49 @@ export class BookingService {
   private graph = new GraphClient();
   private zoom = new ZoomClient();
   private availabilityCache = new Map<string, { expiresAt: number; slots: AvailabilitySlot[] }>();
+
+private buildEventSubject(): string {
+  // Default: minimal PII
+  return "Appointment";
+}
+
+private buildEventBody(params: {
+  tenantSlug: string;
+  bookingId: string;
+  startIsoUtc: string;
+  endIsoUtc: string;
+  timezone: string;
+  locationText?: string;
+  zoomJoinUrl?: string | null;
+}): string {
+  const { tenantSlug, bookingId, startIsoUtc, endIsoUtc, timezone, locationText, zoomJoinUrl } = params;
+  const startLocal = DateTime.fromISO(startIsoUtc, { zone: "utc" }).setZone(timezone).toFormat("yyyy-LL-dd HH:mm");
+  const endLocal = DateTime.fromISO(endIsoUtc, { zone: "utc" }).setZone(timezone).toFormat("HH:mm");
+  const lines: string[] = [];
+  lines.push("Appointment details");
+  lines.push(`When: ${startLocal} - ${endLocal} (${timezone})`);
+  if (locationText) lines.push(`Location: ${locationText}`);
+  if (zoomJoinUrl) lines.push(`Join: ${zoomJoinUrl}`);
+  lines.push(`Booking ID: ${bookingId}`);
+  lines.push(`Page: ${config.baseUrl}/consultation/${tenantSlug}`);
+  return lines.join("\n");
+}
+
+private buildConfirmationEmail(params: {
+  tenantSlug: string;
+  bookingId: string;
+  startIsoUtc: string;
+  endIsoUtc: string;
+  timezone: string;
+  locationText?: string;
+  zoomJoinUrl?: string | null;
+}): { subject: string; body: string } {
+  return {
+    subject: "Appointment confirmed",
+    body: this.buildEventBody(params),
+  };
+}
+
 
   // ---- Public boundary (tenant gate) ----
   private async getPublicTenantOrThrow(tenantSlug: string) {
@@ -86,6 +130,14 @@ export class BookingService {
     if (!booking) throw new NotFoundException("Booking not found");
     return { status: "confirmed", booking_id: booking.id };
   }
+async confirmBookingPublicById(tenantSlug: string, bookingId: string, idempotencyKey: string) {
+  await this.getPublicTenantOrThrow(tenantSlug);
+  const booking = await this.confirmBookingById(tenantSlug, bookingId, idempotencyKey);
+  if (!booking) throw new NotFoundException("Booking not found");
+  return { status: "confirmed", booking_id: booking.id };
+}
+
+
 
   async cancelBookingPublic(tenantSlug: string, bookingId: string, token: string, idempotencyKey: string) {
     await this.getPublicTenantOrThrow(tenantSlug);
@@ -137,16 +189,73 @@ export class BookingService {
       return cached.slots;
     }
 
-    const dayStart = dateFromYmdLocal(date, salesperson.timezone);
-    const slots: AvailabilitySlot[] = [];
-    let cursor = dayStart.set({ hour: 9, minute: 0 });
-    const dayEnd = dayStart.set({ hour: 17, minute: 0 });
 
-    while (cursor < dayEnd) {
-      const end = cursor.plus({ hours: 1 });
-      slots.push({ start_at_utc: cursor.toUTC().toISO() || "", end_at_utc: end.toUTC().toISO() || "" });
-      cursor = end;
+const tzForAvailability = salesperson.timezone || tenant.public_timezone || "Asia/Tokyo";
+const dayStart = dateFromYmdLocal(date, tzForAvailability);
+
+// v1 business hours config (tenant.public_business_hours)
+const cfg = (tenant.public_business_hours || {}) as any;
+const slotMinutes = Number(cfg.slot_minutes ?? 60);
+const leadTimeMinutes = Number(cfg.lead_time_minutes ?? 0);
+const bufferMinutes = Number(cfg.buffer_minutes ?? 10);
+const maxDaysAhead = Number(cfg.max_days_ahead ?? 7);
+const closedDates: string[] = Array.isArray(cfg.closed_dates) ? cfg.closed_dates : [];
+
+const todayLocal = DateTime.utc().setZone(tzForAvailability).startOf("day");
+const targetLocal = dayStart.startOf("day");
+if (targetLocal < todayLocal) return [];
+if (targetLocal > todayLocal.plus({ days: maxDaysAhead })) return [];
+if (closedDates.includes(date)) return [];
+
+const weekdayKey = targetLocal.toFormat("ccc").toLowerCase(); // mon,tue,...
+const weekly = (cfg.weekly || {}) as Record<string, any>;
+const dayCfg = weekly[weekdayKey];
+
+const parseHm = (hm: string, fallback: number) => {
+  if (!hm || typeof hm !== "string") return fallback;
+  const m = hm.match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
+  if (!m) return fallback;
+  return Number(m[1]) * 60 + Number(m[2]);
+};
+
+const openMin = parseHm(dayCfg?.open, 9 * 60);
+const closeMin = parseHm(dayCfg?.close, 17 * 60);
+if (closeMin <= openMin) return [];
+
+const breaks = Array.isArray(dayCfg?.breaks) ? dayCfg.breaks : [];
+const breakRanges = breaks
+  .map((b: any) => ({
+    startMin: parseHm(b?.start, -1),
+    endMin: parseHm(b?.end, -1),
+  }))
+  .filter((r: any) => r.startMin >= 0 && r.endMin > r.startMin);
+
+const dayOpen = targetLocal.set({ hour: Math.floor(openMin / 60), minute: openMin % 60, second: 0, millisecond: 0 });
+const dayEnd = targetLocal.set({ hour: Math.floor(closeMin / 60), minute: closeMin % 60, second: 0, millisecond: 0 });
+
+const leadCutoffUtc = DateTime.utc().plus({ minutes: leadTimeMinutes });
+
+const slots: AvailabilitySlot[] = [];
+let cursor = dayOpen;
+
+while (cursor.plus({ minutes: slotMinutes }) <= dayEnd) {
+  const end = cursor.plus({ minutes: slotMinutes });
+
+  // breaks exclusion
+  const startMinLocal = cursor.hour * 60 + cursor.minute;
+  const endMinLocal = end.hour * 60 + end.minute;
+  const overlapsBreak = breakRanges.some((r: any) => startMinLocal < r.endMin && endMinLocal > r.startMin);
+  if (!overlapsBreak) {
+    const startUtc = cursor.toUTC();
+    if (startUtc >= leadCutoffUtc) {
+      slots.push({
+        start_at_utc: startUtc.toISO() || "",
+        end_at_utc: end.toUTC().toISO() || "",
+      });
     }
+  }
+  cursor = end;
+}
 
     const graphEnabled = process.env.GRAPH_ENABLED !== "0";
 
@@ -157,7 +266,7 @@ export class BookingService {
         busy = await this.graph.getBusySlots(
           tenant.m365_tenant_id,
           salesperson.graph_user_id,
-          dayStart.toUTC().toISO() || "",
+          dayOpen.toUTC().toISO() || "",
           dayEnd.toUTC().toISO() || ""
         );
       } catch (e) {
@@ -174,8 +283,8 @@ export class BookingService {
         const start = DateTime.fromISO(slot.start_at_utc, { zone: "utc" });
         const end = DateTime.fromISO(slot.end_at_utc, { zone: "utc" });
         return !busy.some((b) => {
-          const bStart = DateTime.fromISO(b.startUtc, { zone: "utc" }).minus({ minutes: 10 });
-          const bEnd = DateTime.fromISO(b.endUtc, { zone: "utc" }).plus({ minutes: 10 });
+          const bStart = DateTime.fromISO(b.startUtc, { zone: "utc" }).minus({ minutes: bufferMinutes });
+          const bEnd = DateTime.fromISO(b.endUtc, { zone: "utc" }).plus({ minutes: bufferMinutes });
           return start < bEnd && end > bStart;
         });
       });
@@ -183,7 +292,7 @@ export class BookingService {
 
     // Step A: confirmed + 有効hold/pending_verify を DB から引いて除外
     const now = utcNow();
-    const dayStartUtc = dayStart.toUTC().toJSDate();
+    const dayStartUtc = dayOpen.toUTC().toJSDate();
     const dayEndUtc = dayEnd.toUTC().toJSDate();
     const occupied = await prisma.booking.findMany({
       where: {
@@ -206,8 +315,8 @@ export class BookingService {
       const start = DateTime.fromISO(slot.start_at_utc, { zone: "utc" });
       const end = DateTime.fromISO(slot.end_at_utc, { zone: "utc" });
       return !occupied.some((b) => {
-        const bStart = DateTime.fromJSDate(b.start_at_utc, { zone: "utc" });
-        const bEnd = DateTime.fromJSDate(b.end_at_utc, { zone: "utc" });
+        const bStart = DateTime.fromJSDate(b.start_at_utc, { zone: "utc" }).minus({ minutes: bufferMinutes });
+        const bEnd = DateTime.fromJSDate(b.end_at_utc, { zone: "utc" }).plus({ minutes: bufferMinutes });
         return start < bEnd && end > bStart;
       });
     });
@@ -478,13 +587,9 @@ export class BookingService {
 
     const graphEnabled = process.env.GRAPH_ENABLED !== "0";
     const zoomEnabled = process.env.ZOOM_ENABLED !== "0";
-    const integrationsEnabled =
-      graphEnabled &&
-      zoomEnabled &&
-      !!tenant.m365_tenant_id &&
-      !!booking.salesperson.graph_user_id;
+    const graphReady = graphEnabled && !!tenant.m365_tenant_id && !!booking.salesperson.graph_user_id;
 
-    if (!integrationsEnabled) {
+    if (!graphReady) {
       const result = await prisma.$transaction(async (tx) => {
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${booking.id}))`;
         const latest = await tx.booking.findFirst({ where: { id: booking.id } });
@@ -504,23 +609,33 @@ export class BookingService {
 
     let zoomMeeting: { meetingId: string; joinUrl: string; startUrl: string } | null = null;
     try {
-      zoomMeeting = await this.zoom.createMeeting({
-        topic: `Booking ${booking.id}`,
-        startUtc: startIso,
-        endUtc: endIso,
-        timezone: booking.salesperson.timezone
+      if (zoomEnabled) {
+        zoomMeeting = await this.zoom.createMeeting({
+          topic: this.buildEventSubject(),
+          startUtc: startIso,
+          endUtc: endIso,
+          timezone: booking.salesperson.timezone
+        });
+      }
+
+      const body = this.buildEventBody({
+        tenantSlug,
+        bookingId: booking.id,
+        startIsoUtc: startIso,
+        endIsoUtc: endIso,
+        timezone: booking.salesperson.timezone,
+        zoomJoinUrl: zoomMeeting?.joinUrl ?? null
       });
-      const zm = zoomMeeting;
-      if (!zm) throw new Error("zoomMeeting unexpectedly null");
 
       const graphEvent = await this.graph.createEvent(tenant.m365_tenant_id || "", {
         organizerUserId: booking.salesperson.graph_user_id,
-        subject: `Booking ${booking.id}`,
+        subject: this.buildEventSubject(),
         startUtc: startIso,
         endUtc: endIso,
         timezone: booking.salesperson.timezone,
         attendeeEmail: booking.customer.email,
-        body: `Join URL: ${zm.joinUrl}`
+        body,
+        transactionId: `booking:${booking.id}`
       });
 
       const result = await prisma.$transaction(async (tx) => {
@@ -529,15 +644,17 @@ export class BookingService {
         const latest = await tx.booking.findFirst({ where: { id: booking.id } });
         if (!latest || latest.status === BookingStatus.confirmed) return latest;
 
-        await tx.meeting.create({
-          data: {
-            booking_id: booking.id,
-            provider: "zoom",
-            provider_meeting_id: zm.meetingId,
-            join_url: zm.joinUrl,
-            start_url: zm.startUrl
-          }
-        });
+        if (zoomMeeting) {
+          await tx.meeting.create({
+            data: {
+              booking_id: booking.id,
+              provider: "zoom",
+              provider_meeting_id: zoomMeeting.meetingId,
+              join_url: zoomMeeting.joinUrl,
+              start_url: zoomMeeting.startUrl
+            }
+          });
+        }
 
         await tx.graphEvent.create({
           data: {
@@ -560,6 +677,34 @@ export class BookingService {
       });
 
       await this.recordIdempotency(tenant.id, "confirm", idempotencyKey);
+
+      // Confirmation email (best-effort)
+      try {
+        const email = this.buildConfirmationEmail({
+          tenantSlug,
+          bookingId: booking.id,
+          startIsoUtc: startIso,
+          endIsoUtc: endIso,
+          timezone: booking.salesperson.timezone,
+          zoomJoinUrl: zoomMeeting?.joinUrl ?? null
+        });
+        await this.graph.sendMail(tenant.m365_tenant_id || "", {
+          to: booking.customer.email,
+          subject: email.subject,
+          body: email.body
+        });
+      } catch (e) {
+        log("warn", "confirm_email_send_failed", {
+          tenantSlug,
+          bookingId: booking.id,
+          err: e instanceof Error ? e.message : String(e)
+        });
+        await prisma.booking.update({
+          where: { id: booking.id },
+          data: { customer_notify_required: true }
+        }).catch(() => {});
+      }
+
       return result;
     } catch (err) {
       if (zoomMeeting) {

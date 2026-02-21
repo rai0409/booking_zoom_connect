@@ -14,7 +14,16 @@ export class GraphReconciliationService {
       include: { graph_event: true }
     });
 
-    if (!booking) {
+    if (!booking || !booking.graph_event) {
+      return;
+    }
+
+    const tenant = await prisma.tenant.findUnique({
+      where: { id: booking.tenant_id },
+      select: { m365_tenant_id: true, slug: true }
+    });
+
+    if (!tenant?.m365_tenant_id) {
       return;
     }
 
@@ -56,7 +65,11 @@ export class GraphReconciliationService {
     }
 
     if (job.change_type === "updated") {
-      const event = await this.graph.getEvent(job.resource_id);
+      const event = await this.graph.getEvent(
+        tenant.m365_tenant_id,
+        booking.graph_event.organizer_user_id,
+        job.resource_id
+      );
       const newStart = parseIsoToUtc(event.startUtc);
       const newEnd = parseIsoToUtc(event.endUtc);
 

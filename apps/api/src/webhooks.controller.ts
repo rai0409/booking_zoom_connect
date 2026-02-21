@@ -12,14 +12,13 @@ type GraphNotification = {
   subscriptionId?: string;
   changeType?: string;
   resource?: string;
+  clientState?: string;
   resourceData?: { id?: string };
 };
 
 @Controller("/v1/webhooks")
 export class WebhooksController {
-  constructor(
-    @Inject(WEBHOOK_QUEUE) private readonly queue: IQueue<WebhookQueueItem>
-  ) {}
+  constructor(@Inject(WEBHOOK_QUEUE) private readonly queue: IQueue<WebhookQueueItem>) {}
 
   @Post("/graph")
   async graphWebhook(
@@ -48,6 +47,14 @@ export class WebhooksController {
           where: { subscription_id: subscriptionId }
         });
         if (!subscription) return;
+
+        // Security: verify clientState when configured
+        const expectedClientState = (subscription as any).client_state ?? (subscription as any).clientState;
+        if (expectedClientState) {
+          if (!notification.clientState || notification.clientState !== expectedClientState) {
+            return;
+          }
+        }
 
         const parsed = GraphWebhookJobPayloadSchema.safeParse({
           tenant_id: subscription.tenant_id,
@@ -86,6 +93,7 @@ export class WebhooksController {
               ? `graph:${subscriptionId}:${notification.id}`
               : `graph:${subscriptionId}:${resourceId}:${changeType}`,
             next_run_at_utc: new Date(),
+            raw_notification: notification as any
           }
         });
 
