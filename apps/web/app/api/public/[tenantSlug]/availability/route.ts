@@ -1,14 +1,18 @@
 import { NextResponse } from "next/server";
 
-export async function GET(req: Request, { params }: { params: { tenantSlug: string } }) {
+type RouteContext = { params: Promise<{ tenantSlug: string }> };
+
+export async function GET(req: Request, context: RouteContext) {
+  const params = await context.params;
   const base = process.env.NEXT_PUBLIC_API_BASE!;
   const { searchParams } = new URL(req.url);
-  const salesperson = searchParams.get("salesperson");
   const date = searchParams.get("date");
+  const salesperson = searchParams.get("salesperson");
 
   const url = new URL(`${base}/v1/public/${params.tenantSlug}/availability`);
-  if (salesperson) url.searchParams.set("salesperson", salesperson);
   if (date) url.searchParams.set("date", date);
+  // Backward compatible: salesperson can still be forwarded when explicitly specified.
+  if (salesperson) url.searchParams.set("salesperson", salesperson);
 
   const r = await fetch(url.toString(), { cache: "no-store" });
   const body = await r.text();
