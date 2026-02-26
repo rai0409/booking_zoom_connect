@@ -54,14 +54,14 @@ export class GraphSubscriptionWorker {
           }
         );
 
-        await (prisma.graphSubscription as any).create({
+        await prisma.graphSubscription.create({
           data: {
             tenant_id: salesperson.tenant_id,
             salesperson_id: salesperson.id,
             subscription_id: created.subscriptionId,
             resource,
             expires_at: DateTime.fromISO(created.expiresAtUtc, { zone: "utc" }).toJSDate(),
-            clientState
+            client_state: clientState
           }
         });
         continue;

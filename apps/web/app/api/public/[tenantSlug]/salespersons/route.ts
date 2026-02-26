@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 
-export async function GET(_: Request, { params }: { params: { tenantSlug: string } }) {
+type RouteContext = { params: Promise<{ tenantSlug: string }> };
+
+export async function GET(_: Request, context: RouteContext) {
+  const params = await context.params;
   const base = process.env.NEXT_PUBLIC_API_BASE!;
   const r = await fetch(`${base}/v1/public/${params.tenantSlug}/salespersons`, { cache: "no-store" });
   const body = await r.text();

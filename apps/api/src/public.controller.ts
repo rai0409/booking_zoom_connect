@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Headers, Inject, Param, Post, Query } from "@nestjs/common";
+import { Body, Controller, Get, Headers, Inject, Param, Post, Query, BadRequestException } from "@nestjs/common";
 import { BookingService } from "./services/booking.service";
 
 @Controller("/v1/public")
@@ -8,7 +8,7 @@ export class PublicController {
   @Get(":tenantSlug/availability")
   async availability(
     @Param("tenantSlug") tenantSlug: string,
-    @Query("salesperson") salespersonId: string,
+    @Query("salesperson") salespersonId: string | undefined,
     @Query("date") date: string
   ) {
     return this.bookingService.getAvailabilityPublic(tenantSlug, salespersonId, date);
@@ -24,9 +24,11 @@ export class PublicController {
     @Param("tenantSlug") tenantSlug: string,
     @Headers("Idempotency-Key") idempotencyKey: string,
     @Body() body: {
-      salesperson_id: string;
+      salesperson_id?: string;
       start_at: string;
       end_at: string;
+      booking_mode?: string;
+      public_notes?: string;
       customer: { email: string; name?: string; company?: string };
     }
   ) {
@@ -46,8 +48,14 @@ export class PublicController {
   async confirm(
     @Param("tenantSlug") tenantSlug: string,
     @Headers("Idempotency-Key") idempotencyKey: string,
-    @Body() body: { token: string }
+    @Body() body: { token?: string; booking_id?: string }
   ) {
+    if (body.booking_id) {
+      return this.bookingService.confirmBookingPublicById(tenantSlug, body.booking_id, idempotencyKey);
+    }
+    if (!body.token) {
+      throw new BadRequestException("token or booking_id required");
+    }
     return this.bookingService.confirmBookingPublic(tenantSlug, body.token, idempotencyKey);
   }
 

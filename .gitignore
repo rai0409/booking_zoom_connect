@@ -52,3 +52,6 @@ apps/api/*.log
 
 # Next.js/TS build cache
 apps/web/tsconfig.tsbuildinfo
+
+# local artifacts
+output*.zip

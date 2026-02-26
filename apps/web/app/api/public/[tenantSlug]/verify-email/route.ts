@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 
-export async function POST(req: Request, { params }: { params: { tenantSlug: string } }) {
+type RouteContext = { params: Promise<{ tenantSlug: string }> };
+
+export async function POST(req: Request, context: RouteContext) {
+  const params = await context.params;
   const base = process.env.NEXT_PUBLIC_API_BASE!;
   const idem = req.headers.get("idempotency-key") ?? req.headers.get("Idempotency-Key");
   const payload = await req.json();
