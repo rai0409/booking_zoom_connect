@@ -55,3 +55,10 @@ apps/web/tsconfig.tsbuildinfo
 
 # local artifacts
 output*.zip
+
+# Next.js/TS build cache
+apps/web/tsconfig.tsbuildinfo
+
+# local artifacts / backups
+_local_artifacts/
+*.bak_*

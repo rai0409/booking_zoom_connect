@@ -4,6 +4,7 @@ import { DateTime } from "luxon";
 import { BookingStatus } from "@prisma/client";
 
 const service = new BookingService();
+(service as any).graph = { getBusySlots: async () => [] };
 const ORIGINAL_GRAPH_ENABLED = process.env.GRAPH_ENABLED;
 
 async function resetDb() {
@@ -153,8 +154,7 @@ describe("BookingService", () => {
     const createEvent = jest.fn(async (..._args: any[]) => { throw new Error("graph down"); });
     const sendMail = jest.fn(async (..._args: any[]) => {});
     const deleteEvent = jest.fn(async (..._args: any[]) => {});
-    (service as any).graph = { createEvent, sendMail, deleteEvent };
-
+(service as any).graph = { ...(service as any).graph, createEvent, sendMail, deleteEvent, getBusySlots: async () => [] };
     const createMeeting = jest.fn(async () => ({ meetingId: "m1", joinUrl: "j1", startUrl: "s1" }));
     const deleteMeeting = jest.fn(async (..._args: any[]) => {});
     (service as any).zoom = { createMeeting, deleteMeeting };
@@ -179,7 +179,10 @@ describe("BookingService", () => {
   test("createHold supports round-robin assignment when salesperson_id is omitted", async () => {
     const tenant = await prisma.tenant.findUnique({ where: { slug: "acme" } });
     expect(tenant).toBeTruthy();
-    await prisma.$executeRaw`UPDATE "tenants" SET "rr_cursor" = 0 WHERE "id" = ${tenant!.id}`;
+    await prisma.tenant.update({
+   where: { id: tenant!.id },
+   data: { rr_cursor: 0 },
+ });
 
     const salespersons = await prisma.salesperson.findMany({
       where: { tenant_id: tenant!.id, active: true },
@@ -212,27 +215,33 @@ describe("BookingService", () => {
 
     expect(first.salesperson_id).toEqual(salespersons[0].id);
     expect(second.salesperson_id).toEqual(salespersons[1].id);
-    const firstFields = await prisma.$queryRaw<Array<{ booking_mode: string | null; public_notes: string | null }>>`
-      SELECT "booking_mode", "public_notes" FROM "bookings" WHERE "id" = ${first.id}
-    `;
-    const secondFields = await prisma.$queryRaw<Array<{ booking_mode: string | null; public_notes: string | null }>>`
-      SELECT "booking_mode", "public_notes" FROM "bookings" WHERE "id" = ${second.id}
-    `;
-    expect(firstFields[0]?.booking_mode).toEqual("online");
-    expect(secondFields[0]?.booking_mode).toEqual("offline");
-    expect(firstFields[0]?.public_notes).toEqual("RR note one");
-    expect(secondFields[0]?.public_notes).toEqual("RR note two");
+    const firstFields = await prisma.booking.findUnique({
+      where: { id: first.id },
+      select: { booking_mode: true, public_notes: true },
+    });
+    const secondFields = await prisma.booking.findUnique({
+      where: { id: second.id },
+      select: { booking_mode: true, public_notes: true },
+    });
+    expect(firstFields?.booking_mode).toEqual("online");
+    expect(secondFields?.booking_mode).toEqual("offline");
+    expect(firstFields?.public_notes).toEqual("RR note one");
+    expect(secondFields?.public_notes).toEqual("RR note two");
 
-    const refreshed = await prisma.$queryRaw<Array<{ rr_cursor: number }>>`
-      SELECT "rr_cursor" FROM "tenants" WHERE "id" = ${tenant!.id}
-    `;
-    expect(refreshed[0]?.rr_cursor).toEqual(0);
+    const refreshedTenant = await prisma.tenant.findUnique({
+      where: { id: tenant!.id },
+      select: { rr_cursor: true },
+    });
+    expect(refreshedTenant?.rr_cursor).toEqual(0);
   });
 
   test("createHold keeps rr_cursor when all salespersons are busy", async () => {
     const tenant = await prisma.tenant.findUnique({ where: { slug: "acme" } });
     expect(tenant).toBeTruthy();
-    await prisma.$executeRaw`UPDATE "tenants" SET "rr_cursor" = 0 WHERE "id" = ${tenant!.id}`;
+    await prisma.tenant.update({
+   where: { id: tenant!.id },
+   data: { rr_cursor: 0 },
+ });
 
     const salespersons = await prisma.salesperson.findMany({
       where: { tenant_id: tenant!.id, active: true },
@@ -274,10 +283,11 @@ describe("BookingService", () => {
       )
     ).rejects.toThrow();
 
-    const refreshed = await prisma.$queryRaw<Array<{ rr_cursor: number }>>`
-      SELECT "rr_cursor" FROM "tenants" WHERE "id" = ${tenant!.id}
-    `;
-    expect(refreshed[0]?.rr_cursor).toEqual(0);
+    const refreshedTenant = await prisma.tenant.findUnique({
+      where: { id: tenant!.id },
+      select: { rr_cursor: true },
+    });
+    expect(refreshedTenant?.rr_cursor).toEqual(0);
   });
 
   test("availability union returns slots where at least one salesperson is free", async () => {
