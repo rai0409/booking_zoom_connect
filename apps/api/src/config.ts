@@ -1,5 +1,6 @@
 export const config = {
   baseUrl: process.env.BASE_URL || "http://localhost:3000",
+  apiBaseUrl: process.env.API_BASE_URL || "http://localhost:4000",
   nodeEnv: process.env.NODE_ENV || "development",
   adminApiKey: process.env.ADMIN_API_KEY || "change-me",
   graphMock: (process.env.GRAPH_MOCK || "false").toLowerCase() === "true",

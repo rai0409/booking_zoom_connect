@@ -1,5 +1,6 @@
 import { config } from "../config";
 import { DateTime } from "luxon";
+import { log } from "../utils/logger";
 
 export type GraphEventInput = {
   organizerUserId: string;
@@ -29,9 +30,12 @@ export type GraphSubscriptionInput = { resource: string; expirationUtc: string; 
 export type GraphSubscriptionResult = { subscriptionId: string; expiresAtUtc: string };
 
 type TokenCacheEntry = { accessToken: string; expiresAtMs: number };
+type ScheduleEmailCacheEntry = { email: string; expiresAtMs: number };
 
 export class GraphClient {
   private tokenCache = new Map<string, TokenCacheEntry>();
+  private scheduleEmailCache = new Map<string, ScheduleEmailCacheEntry>();
+  private readonly scheduleEmailTtlMs = 24 * 60 * 60 * 1000;
 
   private graphBase() {
     return "https://graph.microsoft.com/v1.0";
@@ -93,6 +97,46 @@ export class GraphClient {
     return dt.toFormat("yyyy-LL-dd'T'HH:mm:ss");
   }
 
+  private async resolveScheduleEmail(m365TenantId: string, userId: string): Promise<string | null> {
+    const cacheKey = `${m365TenantId}:${userId}`;
+    const cached = this.scheduleEmailCache.get(cacheKey);
+    const now = Date.now();
+    if (cached && cached.expiresAtMs > now) {
+      return cached.email;
+    }
+
+    try {
+      const res = await this.graphFetch(
+        m365TenantId,
+        `/users/${encodeURIComponent(userId)}?$select=mail,userPrincipalName`,
+        { method: "GET" }
+      );
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(`resolveScheduleEmail failed: ${res.status} ${txt}`);
+      }
+
+      const json = (await res.json()) as { mail?: string | null; userPrincipalName?: string | null };
+      const scheduleEmail = String(json.mail || json.userPrincipalName || "").trim();
+      if (!scheduleEmail) {
+        throw new Error("mail and userPrincipalName are empty");
+      }
+
+      this.scheduleEmailCache.set(cacheKey, {
+        email: scheduleEmail,
+        expiresAtMs: now + this.scheduleEmailTtlMs
+      });
+      return scheduleEmail;
+    } catch (err) {
+      log("warn", "graph_schedule_email_resolve_failed", {
+        tenantId: m365TenantId,
+        userId,
+        err: err instanceof Error ? err.message : String(err)
+      });
+      return null;
+    }
+  }
+
   async getBusySlots(m365TenantId: string, userId: string, startUtcIso: string, endUtcIso: string): Promise<GraphBusySlot[]>;
   async getBusySlots(...args: [string, string, string, string]): Promise<GraphBusySlot[]> {
     const [m365TenantId, userId, startUtcIso, endUtcIso] = args;
@@ -104,8 +148,13 @@ export class GraphClient {
       return [];
     }
 
+    const scheduleEmail = await this.resolveScheduleEmail(m365TenantId, userId);
+    if (!scheduleEmail) {
+      return [{ startUtc: startUtcIso, endUtc: endUtcIso }];
+    }
+
     const body = {
-      schedules: [userId],
+      schedules: [scheduleEmail],
       startTime: { dateTime: this.isoNoZ(startUtcIso), timeZone: "UTC" },
       endTime: { dateTime: this.isoNoZ(endUtcIso), timeZone: "UTC" },
       availabilityViewInterval: 60
@@ -300,8 +349,7 @@ export class GraphClient {
         subject: input.subject,
         body: { contentType: "text", content: input.body },
         toRecipients: [{ emailAddress: { address: input.to } }]
-      },
-      saveToSentItems: "true"
+      }
     };
 
     const res = await this.graphFetch(
@@ -330,7 +378,7 @@ export class GraphClient {
     }
     if (!m365TenantId) throw new Error("m365TenantId required");
 
-    const notificationUrl = `${config.baseUrl.replace(/\/$/, "")}/v1/webhooks/graph`;
+    const notificationUrl = `${config.apiBaseUrl.replace(/\/$/, "")}/v1/webhooks/graph`;
 
     const payload: any = {
       changeType: "updated,deleted",

@@ -6,6 +6,7 @@ import { GraphWebhookJobPayloadSchema } from "@booking/shared";
 import { IQueue } from "./queue/queue.interface";
 import { WEBHOOK_QUEUE, WebhookQueueItem } from "./queue/webhook.queue";
 import { Inject } from "@nestjs/common";
+import { log } from "./utils/logger";
 
 type GraphNotification = {
   id?: string;
@@ -52,6 +53,11 @@ export class WebhooksController {
         const expectedClientState = (subscription as any).client_state ?? (subscription as any).clientState;
         if (expectedClientState) {
           if (!notification.clientState || notification.clientState !== expectedClientState) {
+            log("warn", "graph_webhook_client_state_mismatch", {
+              tenantId: subscription.tenant_id,
+              subscriptionId,
+              notificationId: notification.id || null
+            });
             return;
           }
         }

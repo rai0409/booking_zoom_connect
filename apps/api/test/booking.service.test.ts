@@ -42,6 +42,15 @@ describe("BookingService", () => {
         active: true
       }
     });
+    await prisma.salesperson.create({
+      data: {
+        tenant_id: tenant!.id,
+        graph_user_id: "graph-user-002",
+        display_name: "Bob",
+        timezone: "Asia/Tokyo",
+        active: true
+      }
+    });
   });
 
   afterAll(async () => {
@@ -165,5 +174,185 @@ describe("BookingService", () => {
     }
 
     expect(compensation).toBeTruthy();
+  });
+
+  test("createHold supports round-robin assignment when salesperson_id is omitted", async () => {
+    const tenant = await prisma.tenant.findUnique({ where: { slug: "acme" } });
+    expect(tenant).toBeTruthy();
+    await prisma.$executeRaw`UPDATE "tenants" SET "rr_cursor" = 0 WHERE "id" = ${tenant!.id}`;
+
+    const salespersons = await prisma.salesperson.findMany({
+      where: { tenant_id: tenant!.id, active: true },
+      orderBy: { display_name: "asc" }
+    });
+    expect(salespersons.length).toBeGreaterThanOrEqual(2);
+
+    const first = await service.createHold(
+      "acme",
+      {
+        start_at: DateTime.utc().plus({ hours: 26 }).toISO()!,
+        end_at: DateTime.utc().plus({ hours: 27 }).toISO()!,
+        booking_mode: "online",
+        public_notes: "RR note one",
+        customer: { email: "rr1@example.com", name: "RR One" }
+      },
+      "rr-idem-1"
+    );
+    const second = await service.createHold(
+      "acme",
+      {
+        start_at: DateTime.utc().plus({ hours: 28 }).toISO()!,
+        end_at: DateTime.utc().plus({ hours: 29 }).toISO()!,
+        booking_mode: "offline",
+        public_notes: "RR note two",
+        customer: { email: "rr2@example.com", name: "RR Two" }
+      },
+      "rr-idem-2"
+    );
+
+    expect(first.salesperson_id).toEqual(salespersons[0].id);
+    expect(second.salesperson_id).toEqual(salespersons[1].id);
+    const firstFields = await prisma.$queryRaw<Array<{ booking_mode: string | null; public_notes: string | null }>>`
+      SELECT "booking_mode", "public_notes" FROM "bookings" WHERE "id" = ${first.id}
+    `;
+    const secondFields = await prisma.$queryRaw<Array<{ booking_mode: string | null; public_notes: string | null }>>`
+      SELECT "booking_mode", "public_notes" FROM "bookings" WHERE "id" = ${second.id}
+    `;
+    expect(firstFields[0]?.booking_mode).toEqual("online");
+    expect(secondFields[0]?.booking_mode).toEqual("offline");
+    expect(firstFields[0]?.public_notes).toEqual("RR note one");
+    expect(secondFields[0]?.public_notes).toEqual("RR note two");
+
+    const refreshed = await prisma.$queryRaw<Array<{ rr_cursor: number }>>`
+      SELECT "rr_cursor" FROM "tenants" WHERE "id" = ${tenant!.id}
+    `;
+    expect(refreshed[0]?.rr_cursor).toEqual(0);
+  });
+
+  test("createHold keeps rr_cursor when all salespersons are busy", async () => {
+    const tenant = await prisma.tenant.findUnique({ where: { slug: "acme" } });
+    expect(tenant).toBeTruthy();
+    await prisma.$executeRaw`UPDATE "tenants" SET "rr_cursor" = 0 WHERE "id" = ${tenant!.id}`;
+
+    const salespersons = await prisma.salesperson.findMany({
+      where: { tenant_id: tenant!.id, active: true },
+      orderBy: { display_name: "asc" }
+    });
+    const start = DateTime.utc().plus({ hours: 60 }).toJSDate();
+    const end = DateTime.utc().plus({ hours: 61 }).toJSDate();
+
+    const customer = await prisma.customer.upsert({
+      where: { tenant_id_email: { tenant_id: tenant!.id, email: "busy@example.com" } },
+      update: {},
+      create: { tenant_id: tenant!.id, email: "busy@example.com" }
+    });
+
+    for (let i = 0; i < salespersons.length; i += 1) {
+      await prisma.booking.create({
+        data: {
+          tenant_id: tenant!.id,
+          salesperson_id: salespersons[i].id,
+          customer_id: customer.id,
+          start_at_utc: start,
+          end_at_utc: end,
+          status: BookingStatus.confirmed,
+          idempotency_key: `busy-slot-${i}-${Date.now()}`
+        }
+      });
+    }
+
+    await expect(
+      service.createHold(
+        "acme",
+        {
+          start_at: DateTime.fromJSDate(start, { zone: "utc" }).toISO()!,
+          end_at: DateTime.fromJSDate(end, { zone: "utc" }).toISO()!,
+          booking_mode: "online",
+          customer: { email: "newbusy@example.com", name: "Busy User" }
+        },
+        "rr-busy-idem"
+      )
+    ).rejects.toThrow();
+
+    const refreshed = await prisma.$queryRaw<Array<{ rr_cursor: number }>>`
+      SELECT "rr_cursor" FROM "tenants" WHERE "id" = ${tenant!.id}
+    `;
+    expect(refreshed[0]?.rr_cursor).toEqual(0);
+  });
+
+  test("availability union returns slots where at least one salesperson is free", async () => {
+    const tenant = await prisma.tenant.findUnique({ where: { slug: "acme" } });
+    expect(tenant).toBeTruthy();
+
+    await prisma.tenant.update({
+      where: { id: tenant!.id },
+      data: {
+        public_timezone: "UTC",
+        public_business_hours: {
+          slot_minutes: 60,
+          lead_time_minutes: 0,
+          buffer_minutes: 0,
+          max_days_ahead: 30,
+          weekly: {
+            mon: { open: "09:00", close: "11:00", breaks: [] },
+            tue: { open: "09:00", close: "11:00", breaks: [] },
+            wed: { open: "09:00", close: "11:00", breaks: [] },
+            thu: { open: "09:00", close: "11:00", breaks: [] },
+            fri: { open: "09:00", close: "11:00", breaks: [] },
+            sat: { open: "09:00", close: "11:00", breaks: [] },
+            sun: { open: "09:00", close: "11:00", breaks: [] }
+          }
+        }
+      }
+    });
+
+    const salespersons = await prisma.salesperson.findMany({
+      where: { tenant_id: tenant!.id, active: true },
+      orderBy: { display_name: "asc" }
+    });
+    const date = DateTime.utc().plus({ days: 2 }).toFormat("yyyy-LL-dd");
+    const slot1Start = DateTime.fromISO(`${date}T09:00:00`, { zone: "utc" }).toJSDate();
+    const slot1End = DateTime.fromISO(`${date}T10:00:00`, { zone: "utc" }).toJSDate();
+    const slot2Start = DateTime.fromISO(`${date}T10:00:00`, { zone: "utc" }).toJSDate();
+    const slot2End = DateTime.fromISO(`${date}T11:00:00`, { zone: "utc" }).toJSDate();
+
+    const customerA = await prisma.customer.upsert({
+      where: { tenant_id_email: { tenant_id: tenant!.id, email: "union-a@example.com" } },
+      update: {},
+      create: { tenant_id: tenant!.id, email: "union-a@example.com" }
+    });
+    const customerB = await prisma.customer.upsert({
+      where: { tenant_id_email: { tenant_id: tenant!.id, email: "union-b@example.com" } },
+      update: {},
+      create: { tenant_id: tenant!.id, email: "union-b@example.com" }
+    });
+
+    await prisma.booking.create({
+      data: {
+        tenant_id: tenant!.id,
+        salesperson_id: salespersons[0].id,
+        customer_id: customerA.id,
+        start_at_utc: slot1Start,
+        end_at_utc: slot1End,
+        status: BookingStatus.confirmed,
+        idempotency_key: `union-1-${Date.now()}`
+      }
+    });
+    await prisma.booking.create({
+      data: {
+        tenant_id: tenant!.id,
+        salesperson_id: salespersons[1].id,
+        customer_id: customerB.id,
+        start_at_utc: slot2Start,
+        end_at_utc: slot2End,
+        status: BookingStatus.confirmed,
+        idempotency_key: `union-2-${Date.now()}`
+      }
+    });
+
+    (service as any).availabilityCache.clear();
+    const union = await service.getAvailability("acme", undefined, date);
+    expect(union.some((s) => s.start_at_utc === DateTime.fromJSDate(slot1Start, { zone: "utc" }).toISO())).toBeTruthy();
+    expect(union.some((s) => s.start_at_utc === DateTime.fromJSDate(slot2Start, { zone: "utc" }).toISO())).toBeTruthy();
   });
 });

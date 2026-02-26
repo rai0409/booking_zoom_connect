@@ -1,6 +1,11 @@
 import "reflect-metadata";
 import { randomUUID } from "node:crypto";
 
+if (process.env.BOOT_TRACE === "1") {
+  // eslint-disable-next-line no-console
+  console.log(`[boot] main.ts start pid=${process.pid} cwd=${process.cwd()}`);
+}
+
 const g = globalThis as any;
 if (!g.crypto) g.crypto = {};
 if (typeof g.crypto.randomUUID !== "function") {

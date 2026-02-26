@@ -6,12 +6,17 @@ import { GraphReconciliationService } from "./graph-reconciliation.service";
 import { utcNow } from "../utils/time";
 import { WebhookJobStatus } from "@prisma/client";
 import { DateTime } from "luxon";
+import { log } from "../utils/logger";
 
 const MAX_ATTEMPTS = 5;
+const STALE_MINUTES = 5;
+const ENQUEUE_INTERVAL_MS = 2_000;
+const DEQUEUE_IDLE_WAIT_MS = 500;
 
 @Injectable()
 export class WebhookWorker implements OnModuleInit, OnModuleDestroy {
-  private timer: NodeJS.Timeout | null = null;
+  private enqueueTimer: NodeJS.Timeout | null = null;
+  private queueTask: Promise<void> | null = null;
   private running = false;
 
   constructor(
@@ -20,39 +25,89 @@ export class WebhookWorker implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   onModuleInit() {
-    this.timer = setInterval(() => {
-      this.tick().catch(() => {
-        // ignore worker errors
+    this.running = true;
+
+    this.enqueueTimer = setInterval(() => {
+      this.enqueueDueJobs().catch((err) => {
+        log("error", "webhook_enqueue_due_jobs_failed", {
+          err: err instanceof Error ? err.message : String(err)
+        });
       });
-    }, 2_000);
+    }, ENQUEUE_INTERVAL_MS);
+
+    void this.enqueueDueJobs().catch((err) => {
+      log("error", "webhook_enqueue_due_jobs_failed", {
+        err: err instanceof Error ? err.message : String(err)
+      });
+    });
+
+    if (this.queue.consume) {
+      this.queueTask = this.queue.consume(async (item) => {
+        await this.processItem(item);
+      }).catch((err) => {
+        log("error", "webhook_queue_consume_failed", {
+          err: err instanceof Error ? err.message : String(err)
+        });
+      });
+      return;
+    }
+
+    this.queueTask = this.runDequeueLoop();
   }
 
-  onModuleDestroy() {
-    if (this.timer) {
-      clearInterval(this.timer);
+  async onModuleDestroy() {
+    this.running = false;
+    if (this.enqueueTimer) {
+      clearInterval(this.enqueueTimer);
+      this.enqueueTimer = null;
+    }
+    if (this.queue.close) {
+      await this.queue.close().catch((err) => {
+        log("warn", "webhook_queue_close_failed", {
+          err: err instanceof Error ? err.message : String(err)
+        });
+      });
+    }
+    if (this.queueTask) {
+      await this.queueTask.catch(() => {
+        // already logged
+      });
+      this.queueTask = null;
     }
   }
 
-  private async tick() {
-    if (this.running) return;
-    this.running = true;
-
-    try {
-      // Ensure durable retries: enqueue due pending jobs from DB.
-      await this.enqueueDueJobs();
-
-      let item = await this.queue.dequeue();
-      while (item) {
-        await this.processItem(item);
+  private async runDequeueLoop() {
+    while (this.running) {
+      let item: WebhookQueueItem | null = null;
+      try {
         item = await this.queue.dequeue();
+      } catch (err) {
+        log("warn", "webhook_queue_dequeue_failed", {
+          err: err instanceof Error ? err.message : String(err)
+        });
+        await this.sleep(DEQUEUE_IDLE_WAIT_MS);
+        continue;
       }
-    } finally {
-      this.running = false;
+
+      if (!item) {
+        await this.sleep(DEQUEUE_IDLE_WAIT_MS);
+        continue;
+      }
+
+      try {
+        await this.processItem(item);
+      } catch (err) {
+        log("error", "webhook_process_item_failed", {
+          jobId: item.jobId,
+          err: err instanceof Error ? err.message : String(err)
+        });
+      }
     }
   }
 
   private async enqueueDueJobs() {
     const now = utcNow();
+    const staleBefore = DateTime.fromJSDate(now).minus({ minutes: STALE_MINUTES }).toJSDate();
     const due = await prisma.webhookJob.findMany({
       where: {
         status: WebhookJobStatus.pending,
@@ -60,7 +115,7 @@ export class WebhookWorker implements OnModuleInit, OnModuleDestroy {
         next_run_at_utc: { lte: now },
         OR: [
           { processing_started_at_utc: null },
-          { processing_started_at_utc: { lt: DateTime.fromJSDate(now).minus({ minutes: 5 }).toJSDate() } }
+          { processing_started_at_utc: { lt: staleBefore } }
         ]
       },
       orderBy: { next_run_at_utc: "asc" },
@@ -72,10 +127,17 @@ export class WebhookWorker implements OnModuleInit, OnModuleDestroy {
       due.map(async (j) => {
         // claim for enqueue to prevent tight-loop duplicate enqueue
         const claimed = await prisma.webhookJob.updateMany({
-          where: { id: j.id, status: WebhookJobStatus.pending, processing_started_at_utc: null },
+          where: {
+            id: j.id,
+            status: WebhookJobStatus.pending,
+            OR: [
+              { processing_started_at_utc: null },
+              { processing_started_at_utc: { lt: staleBefore } }
+            ]
+          },
           data: { processing_started_at_utc: now }
         });
-        if (claimed.count === 0) return;
+        if (claimed.count !== 1) return;
 
         try {
           await this.queue.enqueue({ jobId: j.id });
@@ -111,7 +173,7 @@ export class WebhookWorker implements OnModuleInit, OnModuleDestroy {
     // If another worker is already processing and it's not stale, skip
     if (job.status === WebhookJobStatus.processing && job.processing_started_at_utc) {
       const started = DateTime.fromJSDate(job.processing_started_at_utc);
-      if (DateTime.utc() < started.plus({ minutes: 5 })) {
+      if (DateTime.utc() < started.plus({ minutes: STALE_MINUTES })) {
         return;
       }
     }
@@ -177,6 +239,12 @@ export class WebhookWorker implements OnModuleInit, OnModuleDestroy {
         meta_json: { status, error },
         created_at_utc: utcNow()
       }
+    });
+  }
+
+  private async sleep(ms: number) {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, ms);
     });
   }
 }
