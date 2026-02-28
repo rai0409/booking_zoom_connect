@@ -12,6 +12,7 @@ import { createWebhookQueue, WEBHOOK_QUEUE } from "./queue/webhook.queue";
 import { WebhookWorker } from "./services/webhook.worker";
 import { GraphReconciliationService } from "./services/graph-reconciliation.service";
 import { GraphSubscriptionWorker } from "./services/graph-subscription.worker";
+import { CompensationWorker } from "./services/compensation.worker";
 
 @Module({
   imports: [ScheduleModule.forRoot()],
@@ -25,6 +26,7 @@ import { GraphSubscriptionWorker } from "./services/graph-subscription.worker";
   providers: [
     BookingService,
     ExpiryWorker,
+    CompensationWorker,
     WebhookWorker,
     ReadyService,
     GraphReconciliationService,

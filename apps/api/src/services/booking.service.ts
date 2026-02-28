@@ -8,6 +8,7 @@ import { parseIsoToUtc, utcNow, toIsoUtc, dateFromYmdLocal } from "../utils/time
 import { signBookingToken, verifyBookingToken, TokenPurpose } from "../utils/jwt";
 import { DateTime } from "luxon";
 import { log } from "../utils/logger";
+import { randomUUID } from "crypto";
 
 const HOLD_TTL_MINUTES = 10;
 const CANCEL_DEADLINE_HOURS = 24;
@@ -1095,14 +1096,31 @@ export class BookingService {
       return result;
     } catch (err) {
       if (zoomMeeting) {
-        await prisma.compensationJob.create({
-          data: {
-            tenant_id: tenant.id,
-            booking_id: booking.id,
-            status: "pending",
-            reason: "graph_failed_after_zoom"
-          }
-        });
+        const compensationJobId = randomUUID();
+        await prisma.$executeRaw`
+          INSERT INTO "compensation_jobs" (
+            "id",
+            "tenant_id",
+            "booking_id",
+            "status",
+            "reason",
+            "payload",
+            "attempts",
+            "created_at",
+            "updated_at"
+          )
+          VALUES (
+            ${compensationJobId}::uuid,
+            ${tenant.id}::uuid,
+            ${booking.id}::uuid,
+            'pending',
+            'graph_failed_after_zoom',
+            ${JSON.stringify({ zoom_meeting_id: zoomMeeting.meetingId })}::jsonb,
+            0,
+            NOW(),
+            NOW()
+          )
+        `;
         try {
           await this.zoom.deleteMeeting(zoomMeeting.meetingId);
         } catch {

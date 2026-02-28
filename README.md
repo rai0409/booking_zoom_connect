@@ -47,6 +47,9 @@ pnpm -C apps/web dev
 
 Copy `.env.example` to `.env` and fill values.
 
+```bash
+cp .env.example .env
+```
 ### Required for local core (DB + public booking flow)
 
 - `DATABASE_URL`

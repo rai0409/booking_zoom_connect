@@ -216,7 +216,12 @@ model CompensationJob {
   booking_id String   @db.Uuid
   status     String
   reason     String
+  payload    Json?
+  attempts   Int      @default(0)
+  last_error String?
+  next_run_at DateTime? @db.Timestamptz(6)
   created_at DateTime @default(now()) @db.Timestamptz(6)
+  updated_at DateTime @updatedAt @db.Timestamptz(6)
   booking    Booking  @relation(fields: [booking_id], references: [id])
   tenant     Tenant   @relation(fields: [tenant_id], references: [id])
 

@@ -174,6 +174,13 @@ describe("BookingService", () => {
     }
 
     expect(compensation).toBeTruthy();
+    const [compensationPayload] = await prisma.$queryRaw<Array<{ payload: unknown }>>`
+      SELECT "payload"
+      FROM "compensation_jobs"
+      WHERE "booking_id" = ${booking2.id}::uuid
+      LIMIT 1
+    `;
+    expect(compensationPayload?.payload).toEqual({ zoom_meeting_id: "m1" });
   });
 
   test("createHold supports round-robin assignment when salesperson_id is omitted", async () => {
