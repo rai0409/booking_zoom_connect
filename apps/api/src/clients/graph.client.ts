@@ -97,6 +97,19 @@ export class GraphClient {
     return dt.toFormat("yyyy-LL-dd'T'HH:mm:ss");
   }
 
+  private async readPatchEtag(res: Response): Promise<string> {
+    const txt = await res.text().catch(() => "");
+    let json: any = null;
+    if (txt) {
+      try {
+        json = JSON.parse(txt);
+      } catch {
+        json = null;
+      }
+    }
+    return String(json?.["@odata.etag"] || res.headers.get("etag") || "");
+  }
+
   private async resolveScheduleEmail(m365TenantId: string, userId: string): Promise<string | null> {
     const cacheKey = `${m365TenantId}:${userId}`;
     const cached = this.scheduleEmailCache.get(cacheKey);
@@ -245,6 +258,71 @@ export class GraphClient {
       iCalUId: String(json?.iCalUId || ""),
       etag: String(etag)
     };
+  }
+
+  async updateEventTimes(
+    m365TenantId: string,
+    organizerUserId: string,
+    eventId: string,
+    input: { startUtc: string; endUtc: string }
+  ): Promise<{ etag: string }> {
+    if (config.graphMock) {
+      void m365TenantId;
+      void organizerUserId;
+      void eventId;
+      void input;
+      return { etag: `mock-etag-${Date.now()}` };
+    }
+
+    const res = await this.graphFetch(
+      m365TenantId,
+      `/users/${encodeURIComponent(organizerUserId)}/events/${encodeURIComponent(eventId)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          start: { dateTime: this.isoNoZ(input.startUtc), timeZone: "UTC" },
+          end: { dateTime: this.isoNoZ(input.endUtc), timeZone: "UTC" }
+        })
+      }
+    );
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`updateEventTimes failed: ${res.status} ${txt}`);
+    }
+
+    return { etag: await this.readPatchEtag(res) };
+  }
+
+  async updateEventBody(
+    m365TenantId: string,
+    organizerUserId: string,
+    eventId: string,
+    input: { bodyText: string }
+  ): Promise<{ etag: string }> {
+    if (config.graphMock) {
+      void m365TenantId;
+      void organizerUserId;
+      void eventId;
+      void input;
+      return { etag: `mock-etag-${Date.now()}` };
+    }
+
+    const res = await this.graphFetch(
+      m365TenantId,
+      `/users/${encodeURIComponent(organizerUserId)}/events/${encodeURIComponent(eventId)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          body: { contentType: "text", content: input.bodyText }
+        })
+      }
+    );
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`updateEventBody failed: ${res.status} ${txt}`);
+    }
+
+    return { etag: await this.readPatchEtag(res) };
   }
 
   async getEvent(m365TenantId: string, organizerUserId: string, eventId: string): Promise<GraphEventDetails>;
