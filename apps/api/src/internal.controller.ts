@@ -57,6 +57,16 @@ export class InternalController {
     return this.bookingService.buildCustomerLinksInternal(tenantSlug, bookingId);
   }
 
+  @Post(":tenantSlug/bookings/:bookingId/reinvite")
+  async reinvite(
+    @Param("tenantSlug") tenantSlug: string,
+    @Param("bookingId") bookingId: string,
+    @Headers("x-admin-api-key") apiKey: string | undefined
+  ) {
+    this.assertAdminApiKey(apiKey);
+    return this.bookingService.reinviteBookingInternal(tenantSlug, bookingId);
+  }
+
   @Post("attendance/:bookingId")
   async attendance(
     @Param("bookingId") bookingId: string,

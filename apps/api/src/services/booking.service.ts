@@ -129,6 +129,83 @@ export class BookingService {
     return { booking_id: booking.id, cancel_url: links.cancelUrl, reschedule_url: links.rescheduleUrl };
   }
 
+  private canPatchGraphEvent(tenant: { m365_tenant_id: string | null }, booking: {
+    graph_event?: { organizer_user_id: string; event_id: string } | null;
+  }) {
+    return (
+      process.env.GRAPH_ENABLED !== "0" &&
+      !!tenant.m365_tenant_id &&
+      !!booking.graph_event?.organizer_user_id &&
+      !!booking.graph_event?.event_id
+    );
+  }
+
+  private async patchGraphEventTimesBestEffort(params: {
+    tenantId: string;
+    m365TenantId: string;
+    bookingId: string;
+    organizerUserId: string;
+    eventId: string;
+    startUtc: Date;
+    endUtc: Date;
+    action: string;
+  }) {
+    try {
+      const patched = await this.graph.updateEventTimes(
+        params.m365TenantId,
+        params.organizerUserId,
+        params.eventId,
+        {
+          startUtc: toIsoUtc(params.startUtc),
+          endUtc: toIsoUtc(params.endUtc)
+        }
+      );
+      await prisma.$transaction(async (tx) => {
+        await tx.graphEvent.update({
+          where: { booking_id: params.bookingId },
+          data: {
+            etag: patched.etag,
+            updated_at: utcNow()
+          }
+        });
+        await tx.booking.update({
+          where: { id: params.bookingId },
+          data: { customer_reinvite_required: false }
+        });
+      });
+    } catch (e) {
+      const err = e instanceof Error ? e.message : String(e);
+      log("warn", "graph_patch_failed", {
+        action: params.action,
+        bookingId: params.bookingId,
+        organizerUserId: params.organizerUserId,
+        eventId: params.eventId,
+        err
+      });
+      await prisma.$transaction(async (tx) => {
+        await tx.booking.update({
+          where: { id: params.bookingId },
+          data: { customer_reinvite_required: true }
+        });
+        await tx.trackingEvent.create({
+          data: {
+            tenant_id: params.tenantId,
+            booking_id: params.bookingId,
+            type: "graph.patch_failed",
+            occurred_at_utc: utcNow(),
+            meta_json: {
+              action: params.action,
+              booking_id: params.bookingId,
+              organizer_user_id: params.organizerUserId,
+              event_id: params.eventId,
+              error: err
+            }
+          }
+        });
+      });
+    }
+  }
+
   private normalizeBookingMode(mode: string | undefined): BookingMode {
     if (!mode || mode === "online") return "online";
     if (mode === "offline") return "offline";
@@ -1219,7 +1296,7 @@ export class BookingService {
 
     const booking = await prisma.booking.findFirst({
       where: { id: bookingId, tenant_id: tenant.id },
-      include: { salesperson: true }
+      include: { salesperson: true, graph_event: true }
     });
     if (!booking) throw new NotFoundException("Booking not found");
 
@@ -1249,6 +1326,18 @@ export class BookingService {
       booking.start_at_utc.getTime() === newStartAt.getTime() &&
       booking.end_at_utc.getTime() === newEndAt.getTime();
     if (sameAsCurrent) {
+      if (booking.customer_reinvite_required && this.canPatchGraphEvent(tenant, booking)) {
+        await this.patchGraphEventTimesBestEffort({
+          tenantId: tenant.id,
+          m365TenantId: tenant.m365_tenant_id || "",
+          bookingId: booking.id,
+          organizerUserId: booking.graph_event!.organizer_user_id,
+          eventId: booking.graph_event!.event_id,
+          startUtc: booking.start_at_utc,
+          endUtc: booking.end_at_utc,
+          action: "reschedule_patch"
+        });
+      }
       await this.recordIdempotency(tenant.id, "reschedule", idempotencyKey);
       return {
         status: "rescheduled",
@@ -1340,6 +1429,19 @@ export class BookingService {
 
     await this.recordIdempotency(tenant.id, "reschedule", idempotencyKey);
 
+    if (this.canPatchGraphEvent(tenant, booking)) {
+      await this.patchGraphEventTimesBestEffort({
+        tenantId: tenant.id,
+        m365TenantId: tenant.m365_tenant_id || "",
+        bookingId: booking.id,
+        organizerUserId: booking.graph_event!.organizer_user_id,
+        eventId: booking.graph_event!.event_id,
+        startUtc: newStartAt,
+        endUtc: newEndAt,
+        action: "reschedule_patch"
+      });
+    }
+
     const tz = booking.salesperson?.timezone ?? "utc";
     this.invalidateAvailabilityCacheForStart(tenant.id, booking.salesperson_id, tz, booking.start_at_utc);
     this.invalidateAvailabilityCacheForStart(tenant.id, booking.salesperson_id, tz, newStartAt);
@@ -1352,6 +1454,99 @@ export class BookingService {
       new_start_at_utc: toIsoUtc(result.newStartAtUtc),
       new_end_at_utc: toIsoUtc(result.newEndAtUtc)
     };
+  }
+
+  async reinviteBookingInternal(tenantSlug: string, bookingId: string) {
+    const tenant = await prisma.tenant.findUnique({
+      where: { slug: tenantSlug },
+      select: { id: true, m365_tenant_id: true }
+    });
+    if (!tenant) throw new NotFoundException("Tenant not found");
+
+    const booking = await prisma.booking.findFirst({
+      where: { id: bookingId, tenant_id: tenant.id },
+      include: { graph_event: true }
+    });
+    if (!booking) throw new NotFoundException("Booking not found");
+    if (process.env.GRAPH_ENABLED === "0") {
+      throw new BadRequestException("Graph is disabled");
+    }
+    if (!tenant.m365_tenant_id) {
+      throw new BadRequestException("Tenant Microsoft Graph is not configured");
+    }
+    if (!booking.graph_event?.organizer_user_id || !booking.graph_event?.event_id) {
+      throw new BadRequestException("Graph event is not available");
+    }
+
+    const bodyText = "=== BookingMVP Sync ===\nThis event was re-synced from booking system.\n";
+
+    try {
+      const patched = await this.graph.updateEventBody(
+        tenant.m365_tenant_id,
+        booking.graph_event.organizer_user_id,
+        booking.graph_event.event_id,
+        { bodyText }
+      );
+      await prisma.$transaction(async (tx) => {
+        await tx.graphEvent.update({
+          where: { booking_id: booking.id },
+          data: {
+            etag: patched.etag,
+            updated_at: utcNow()
+          }
+        });
+        await tx.booking.update({
+          where: { id: booking.id },
+          data: { customer_reinvite_required: false }
+        });
+        await tx.trackingEvent.create({
+          data: {
+            tenant_id: tenant.id,
+            booking_id: booking.id,
+            type: "booking.reinvited",
+            occurred_at_utc: utcNow(),
+            meta_json: {
+              by: "internal_api",
+              booking_id: booking.id,
+              organizer_user_id: booking.graph_event!.organizer_user_id,
+              event_id: booking.graph_event!.event_id
+            }
+          }
+        });
+      });
+      return { ok: true };
+    } catch (e) {
+      const err = e instanceof Error ? e.message : String(e);
+      log("warn", "graph_patch_failed", {
+        action: "reinvite_body",
+        bookingId: booking.id,
+        organizerUserId: booking.graph_event.organizer_user_id,
+        eventId: booking.graph_event.event_id,
+        err
+      });
+      await prisma.$transaction(async (tx) => {
+        await tx.booking.update({
+          where: { id: booking.id },
+          data: { customer_reinvite_required: true }
+        });
+        await tx.trackingEvent.create({
+          data: {
+            tenant_id: tenant.id,
+            booking_id: booking.id,
+            type: "graph.patch_failed",
+            occurred_at_utc: utcNow(),
+            meta_json: {
+              action: "reinvite_body",
+              booking_id: booking.id,
+              organizer_user_id: booking.graph_event!.organizer_user_id,
+              event_id: booking.graph_event!.event_id,
+              error: err
+            }
+          }
+        });
+      });
+      throw new BadRequestException(`Graph body patch failed: ${err}`);
+    }
   }
 
   async recordAttendance(bookingId: string, tenantId: string, status: "attended" | "no_show") {
