@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.build.json",
     "lint": "echo 'lint: skipped'",
     "format": "echo 'format: skipped'",
+    "graph:subs:create": "node -r ts-node/register src/cli/create_graph_subscriptions.ts",
     "db:migrate": "prisma migrate dev --schema prisma/schema.prisma",
     "db:seed": "prisma db seed --schema prisma/schema.prisma",
     "test": "jest --runInBand"

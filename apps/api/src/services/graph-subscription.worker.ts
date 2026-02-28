@@ -17,6 +17,7 @@ let warnedMailbox404 = false;
 @Injectable()
 export class GraphSubscriptionWorker {
   private graph: GraphClient | null = null;
+
   private getGraph() {
     if (!this.graph) this.graph = new GraphClient();
     return this.graph;
@@ -25,6 +26,14 @@ export class GraphSubscriptionWorker {
   @Interval(60_000)
   async ensureSubscriptions() {
     if (process.env.GRAPH_ENABLED === "0") return;
+    await this.syncSubscriptions(false);
+  }
+
+  async runOnce(): Promise<void> {
+    await this.syncSubscriptions(true);
+  }
+
+  private async syncSubscriptions(verbose: boolean) {
     if (process.env.GRAPH_SUBSCRIPTION_WORKER_ENABLED === "0") {
       if (!warnedDisabled) {
         log("info", "graph_subscription_worker_disabled", {});
@@ -32,7 +41,13 @@ export class GraphSubscriptionWorker {
       }
       return;
     }
+
+    // In mock mode, do not spam Graph
     if (config.graphMock) return;
+
+    // NOTE: Worker can operate without a shared mailbox if it subscribes per-user.
+    // Keep this guard as requested for safe enablement; if MS_SHARED_MAILBOX is not configured,
+    // skip subscription work to avoid confusing 404 spam.
     if (!config.msSharedMailbox || config.msSharedMailbox === "change-me" || !config.msSharedMailbox.includes("@")) {
       if (!warnedMissingMailbox) {
         log("warn", "graph_subscription_worker_skipped_invalid_ms_shared_mailbox", {});
@@ -40,21 +55,25 @@ export class GraphSubscriptionWorker {
       }
       return;
     }
+
     const graph = this.getGraph();
     const salespersons = await prisma.salesperson.findMany({
       where: { active: true },
       include: { tenant: true }
     });
+    const eligibleSalespersons = salespersons.filter((salesperson) => salesperson.tenant.status === TenantStatus.active);
 
     const now = DateTime.utc();
     const desiredExpiration = now.plus({ hours: SUBSCRIPTION_DURATION_HOURS });
     const renewalCutoff = now.plus({ minutes: RENEWAL_THRESHOLD_MINUTES });
+    let createdCount = 0;
+    let renewedCount = 0;
 
-    for (const salesperson of salespersons) {
-      if (salesperson.tenant.status !== TenantStatus.active) {
-        continue;
-      }
+    if (verbose) {
+      console.log(`target_salespersons=${eligibleSalespersons.length}`);
+    }
 
+    for (const salesperson of eligibleSalespersons) {
       const resource = `users/${salesperson.graph_user_id}/events`;
       const existing = await prisma.graphSubscription.findFirst({
         where: {
@@ -66,14 +85,11 @@ export class GraphSubscriptionWorker {
       if (!existing) {
         const clientState = randomSecret();
         try {
-          const created = await graph.createSubscription(
-            salesperson.tenant.m365_tenant_id || "",
-            {
-              resource,
-              expirationUtc: desiredExpiration.toISO() || "",
-              clientState
-            }
-          );
+          const created = await graph.createSubscription(salesperson.tenant.m365_tenant_id || "", {
+            resource,
+            expirationUtc: desiredExpiration.toISO() || "",
+            clientState
+          });
 
           await prisma.graphSubscription.create({
             data: {
@@ -85,6 +101,8 @@ export class GraphSubscriptionWorker {
               client_state: clientState
             }
           });
+
+          createdCount += 1;
         } catch (e) {
           const err = e instanceof Error ? e.message : String(e);
           const lower = err.toLowerCase();
@@ -97,11 +115,15 @@ export class GraphSubscriptionWorker {
               log("warn", "graph_subscription_worker_mailbox_unavailable", { err });
               warnedMailbox404 = true;
             }
+            // Stop the noisy loop for this tick.
             return;
           }
+
           log("warn", "graph_subscription_worker_error", { err });
-          return;
+          // Do not abort the entire worker; continue to next salesperson.
+          continue;
         }
+
         continue;
       }
 
@@ -119,12 +141,21 @@ export class GraphSubscriptionWorker {
               expires_at: DateTime.fromISO(renewed.expiresAtUtc, { zone: "utc" }).toJSDate()
             }
           });
+
+          renewedCount += 1;
         } catch (e) {
           const err = e instanceof Error ? e.message : String(e);
           log("warn", "graph_subscription_worker_error", { err });
-          return;
+          // Do not abort the entire worker; continue to next salesperson.
+          continue;
         }
       }
+    }
+
+    if (verbose) {
+      console.log(`created_subscriptions=${createdCount}`);
+      console.log(`renewed_subscriptions=${renewedCount}`);
+      console.log("done");
     }
   }
 }
