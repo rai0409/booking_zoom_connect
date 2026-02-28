@@ -1,0 +1,9 @@
+ALTER TABLE "compensation_jobs"
+ADD COLUMN "payload" JSONB,
+ADD COLUMN "attempts" INTEGER NOT NULL DEFAULT 0,
+ADD COLUMN "last_error" TEXT,
+ADD COLUMN "next_run_at" TIMESTAMPTZ(6),
+ADD COLUMN "updated_at" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP;
+
+ALTER TABLE "compensation_jobs"
+ALTER COLUMN "updated_at" DROP DEFAULT;
