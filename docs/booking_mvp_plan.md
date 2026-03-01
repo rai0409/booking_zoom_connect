@@ -57,8 +57,8 @@
    - `BookingService.getAvailability()` を設定反映に置換（slot/lead/buffer/breaks/maxDaysAhead/closedDates）
 
 2. **即確定フローに切替**
-   - UI：`hold → confirm(booking_id)`
-   - API：`POST /v1/public/:tenantSlug/confirm` が `booking_id` を受け取れるようにする（tokenも互換で残す）
+   - UI：`hold → verify-email → confirm(token)`
+   - API：`POST /v1/public/:tenantSlug/confirm` は `token` のみ受け付ける
 
 3. **Service Bus の実装（まずWebhookキュー）**
    - `ServiceBusQueue` を実装

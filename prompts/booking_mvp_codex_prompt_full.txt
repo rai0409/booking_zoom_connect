@@ -144,14 +144,14 @@ Endpoints:
      - generate short-lived JWT verify token (exp <= holds.expires_at_utc)
      - include jti; store verify_token_jti in bookings
      - send email from shared mailbox with link:
-       `${BASE_URL}/verify?token=...`
+       `${BASE_URL}/public/:tenantSlug?token=...`
      - set status=pending_verify
    - If already pending_verify and token not expired, re-send same token (idempotent).
    - If expired, mark expired and return 409.
 
 4) POST /v1/public/:tenantSlug/confirm
    - Headers: Idempotency-Key required
-   - body: { token }
+   - body: { token } only (booking_id confirm is not supported)
    - Verify JWT (iss/aud/exp), extract tenant_id, booking_id, jti.
    - Enforce one-time use:
      - compare jti with bookings.verify_token_jti

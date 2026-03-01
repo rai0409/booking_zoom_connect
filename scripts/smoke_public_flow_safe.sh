@@ -30,6 +30,8 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
+export PUBLIC_RETURN_VERIFY_TOKEN=1
+
 if [[ -z "${ADMIN_API_KEY:-}" ]]; then
   echo "ADMIN_API_KEY missing in .env" >&2
   exit 1

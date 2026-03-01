@@ -7,6 +7,7 @@ export async function POST(req: Request, context: RouteContext) {
   const base = process.env.NEXT_PUBLIC_API_BASE!;
   const idem = req.headers.get("idempotency-key") ?? req.headers.get("Idempotency-Key");
   const payload = await req.json();
+  const token = payload?.token;
 
   const r = await fetch(`${base}/v1/public/${params.tenantSlug}/confirm`, {
     method: "POST",
@@ -14,7 +15,7 @@ export async function POST(req: Request, context: RouteContext) {
       "Content-Type": "application/json",
       ...(idem ? { "Idempotency-Key": idem } : {}),
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({ token }),
   });
 
   const body = await r.text();

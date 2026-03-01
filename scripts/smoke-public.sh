@@ -18,6 +18,8 @@ if [[ -f "$ROOT/.env" ]]; then
   set +a
 fi
 
+export PUBLIC_RETURN_VERIFY_TOKEN=1
+
 BASE_URL="${BASE_URL:-http://localhost:4000}"
 TENANT_SLUG="${TENANT_SLUG:-acme}"
 
@@ -109,7 +111,7 @@ CONFIRM_RES="$(
     -H "Idempotency-Key: ${IDEMP}" \
     -d "$(jq -n --arg t "$TOKEN" '{token:$t}')"
 )"
-echo "$CONFIRM_RES" | jq -e '.status=="confirmed" and .id=="'"$BOOKING_ID"'"' >/dev/null
+echo "$CONFIRM_RES" | jq -e '.status=="confirmed" and .booking_id=="'"$BOOKING_ID"'"' >/dev/null
 say "confirmed"
 
 # ---- DB assert ----

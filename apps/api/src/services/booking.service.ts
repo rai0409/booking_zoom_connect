@@ -308,7 +308,11 @@ export class BookingService {
 
   async sendVerificationPublic(tenantSlug: string, bookingId: string, idempotencyKey: string) {
     await this.getPublicTenantOrThrow(tenantSlug);
-    return this.sendVerification(tenantSlug, bookingId, idempotencyKey);
+    const result = await this.sendVerification(tenantSlug, bookingId, idempotencyKey);
+    if (process.env.PUBLIC_RETURN_VERIFY_TOKEN === "1") {
+      return result;
+    }
+    return { status: result.status };
   }
 
   async confirmBookingPublic(tenantSlug: string, token: string, idempotencyKey: string) {
@@ -865,10 +869,11 @@ export class BookingService {
     const graphEnabled = process.env.GRAPH_ENABLED !== "0";
     if (graphEnabled && tenant.m365_tenant_id) {
       try {
+        const verifyUrl = `${config.baseUrl}/public/${tenantSlug}?token=${encodeURIComponent(token)}`;
         await this.graph.sendMail(tenant.m365_tenant_id, {
           to: booking.customer.email,
           subject: `Booking verification ${booking.id}`,
-          body: `Please verify your booking: ${token}`
+          body: `Please verify your booking: ${verifyUrl}`
         });
       } catch (e) {
         log("warn", "verify_email_send_failed", {
@@ -970,6 +975,14 @@ export class BookingService {
     if (!booking || !booking.customer || !booking.salesperson) throw new NotFoundException("Booking not found");
 
     if (booking.verify_token_jti !== tokenPayload.jti) {
+      log("warn", "confirm_rejected", {
+        tenantSlug,
+        bookingId: booking.id,
+        bookingStatus: booking.status,
+        verifyTokenJti: booking.verify_token_jti,
+        tokenJti: tokenPayload.jti,
+        holdExpiresAtUtc: booking.hold ? toIsoUtc(booking.hold.expires_at_utc) : null
+      });
       throw new ForbiddenException("Token already used");
     }
 
@@ -979,10 +992,26 @@ export class BookingService {
     }
 
     if (booking.status !== BookingStatus.pending_verify) {
+      log("warn", "confirm_rejected", {
+        tenantSlug,
+        bookingId: booking.id,
+        bookingStatus: booking.status,
+        verifyTokenJti: booking.verify_token_jti,
+        tokenJti: tokenPayload.jti,
+        holdExpiresAtUtc: booking.hold ? toIsoUtc(booking.hold.expires_at_utc) : null
+      });
       throw new ConflictException("Invalid booking state");
     }
 
     if (booking.hold && booking.hold.expires_at_utc <= utcNow()) {
+      log("warn", "confirm_rejected", {
+        tenantSlug,
+        bookingId: booking.id,
+        bookingStatus: booking.status,
+        verifyTokenJti: booking.verify_token_jti,
+        tokenJti: tokenPayload.jti,
+        holdExpiresAtUtc: toIsoUtc(booking.hold.expires_at_utc)
+      });
       await prisma.booking.update({ where: { id: booking.id }, data: { status: BookingStatus.expired } });
       throw new ConflictException("Hold expired");
     }

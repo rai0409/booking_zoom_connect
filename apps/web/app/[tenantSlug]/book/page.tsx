@@ -25,7 +25,7 @@ export default function BookingPage({ params }: { params: { tenantSlug: string }
   const [name, setName] = useState("");
   const [company, setCompany] = useState("");
   const [hold, setHold] = useState<HoldResponse | null>(null);
-  const [verifyToken, setVerifyToken] = useState<string | null>(null);
+  const [verifyUrl, setVerifyUrl] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
 
   useEffect(() => {
@@ -76,8 +76,10 @@ export default function BookingPage({ params }: { params: { tenantSlug: string }
     });
 
     const data = (await res.json()) as VerifyResponse;
-    setVerifyToken(data.token || null);
-    setStatus(res.ok ? "Verification sent" : "Failed to send verification");
+    setVerifyUrl(
+      data.token ? `/public/${encodeURIComponent(params.tenantSlug)}?token=${encodeURIComponent(data.token)}` : null
+    );
+    setStatus(res.ok ? "Verification sent. Check your email." : "Failed to send verification");
   }
 
   return (
@@ -140,11 +142,12 @@ export default function BookingPage({ params }: { params: { tenantSlug: string }
         <button type="button" onClick={sendVerification} disabled={!hold}>
           Send verification email
         </button>
-        {verifyToken ? (
+        <p>Check your email to continue.</p>
+        {verifyUrl ? (
           <p>
-            Verify link: {" "}
-            <a href={`/verify?token=${encodeURIComponent(verifyToken)}&tenant=${encodeURIComponent(params.tenantSlug)}`}>
-              /verify?token=...&tenant=...
+            Dev verify link:{" "}
+            <a href={verifyUrl}>
+              {verifyUrl}
             </a>
           </p>
         ) : null}

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "next/navigation";
 
 type Slot = { start_at_utc: string; end_at_utc: string };
 type HoldResp = { id: string; status: string; start_at_utc: string; end_at_utc: string; hold: { expires_at_utc: string } };
@@ -9,6 +10,9 @@ type ConfirmResp = { status: string; booking_id: string; cancel_url?: string; re
 
 export default function PublicBookingPage({ params }: { params: { tenantSlug: string } }) {
   const tenantSlug = params.tenantSlug;
+  const searchParams = useSearchParams();
+  const token = searchParams.get("token") || "";
+  const storageKey = useMemo(() => `public-booking:${tenantSlug}:booking_id`, [tenantSlug]);
 
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [slots, setSlots] = useState<Slot[]>([]);
@@ -23,6 +27,10 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState("");
   const [done, setDone] = useState<ConfirmResp | null>(null);
+  const [awaitingEmail, setAwaitingEmail] = useState(false);
+  const [storedBookingId, setStoredBookingId] = useState<string | null>(null);
+  const [confirmRetryable, setConfirmRetryable] = useState(false);
+  const [confirmedToken, setConfirmedToken] = useState<string | null>(null);
 
   const selectedLabel = useMemo(() => {
     if (!selected) return "";
@@ -30,6 +38,12 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
   }, [selected]);
 
   useEffect(() => {
+    const saved = window.localStorage.getItem(storageKey);
+    if (saved) setStoredBookingId(saved);
+  }, [storageKey]);
+
+  useEffect(() => {
+    if (token) return;
     let cancelled = false;
     (async () => {
       setLoadingSlots(true);
@@ -53,7 +67,72 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
     return () => {
       cancelled = true;
     };
-  }, [tenantSlug, date]);
+  }, [tenantSlug, date, token]);
+
+  useEffect(() => {
+    if (!token || done || confirmedToken === token) return;
+
+    let cancelled = false;
+    (async () => {
+      setConfirmedToken(token);
+      setSubmitting(true);
+      setErr("");
+      setAwaitingEmail(false);
+      setConfirmRetryable(false);
+      const confirmRes = await fetch(`/api/public/${tenantSlug}/confirm`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+        body: JSON.stringify({ token })
+      });
+      const confirmTxt = await confirmRes.text();
+      if (cancelled) return;
+      if (!confirmRes.ok) {
+        if (confirmRes.status === 401 || confirmRes.status === 409) {
+          setErr("確認リンクの有効期限が切れているか、既に使用されています。確認メールを再送してください。");
+          setConfirmRetryable(true);
+        } else {
+          setErr(`予約確定に失敗しました: ${confirmRes.status} ${confirmTxt}`);
+        }
+        setSubmitting(false);
+        return;
+      }
+
+      setDone(JSON.parse(confirmTxt) as ConfirmResp);
+      window.localStorage.removeItem(storageKey);
+      setStoredBookingId(null);
+      setSubmitting(false);
+    })().catch((e) => {
+      if (cancelled) return;
+      setErr(`予約確定に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+      setSubmitting(false);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [confirmedToken, done, storageKey, tenantSlug, token]);
+
+  async function resendVerificationEmail() {
+    if (!storedBookingId) return;
+
+    setSubmitting(true);
+    setErr("");
+    const verifyRes = await fetch(`/api/public/${tenantSlug}/verify-email`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+      body: JSON.stringify({ booking_id: storedBookingId })
+    });
+    const verifyTxt = await verifyRes.text();
+    if (!verifyRes.ok) {
+      setErr(`確認メールの再送に失敗しました: ${verifyRes.status} ${verifyTxt}`);
+      setSubmitting(false);
+      return;
+    }
+
+    setAwaitingEmail(true);
+    setConfirmRetryable(false);
+    setSubmitting(false);
+  }
 
   async function submitBooking() {
     if (!selected) {
@@ -71,11 +150,12 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
 
     setErr("");
     setSubmitting(true);
+    setAwaitingEmail(false);
+    setConfirmRetryable(false);
 
     try {
       const holdKey = crypto.randomUUID();
       const verifyKey = crypto.randomUUID();
-      const confirmKey = crypto.randomUUID();
 
       const holdPayload = {
         start_at: selected.start_at_utc,
@@ -97,6 +177,8 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
         return;
       }
       const hold = JSON.parse(holdTxt) as HoldResp;
+      window.localStorage.setItem(storageKey, hold.id);
+      setStoredBookingId(hold.id);
 
       const verifyRes = await fetch(`/api/public/${tenantSlug}/verify-email`, {
         method: "POST",
@@ -110,22 +192,8 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
         return;
       }
 
-      const verify = JSON.parse(verifyTxt) as VerifyResp;
-      const confirmPayload = verify.token ? { token: verify.token } : { booking_id: hold.id };
-
-      const confirmRes = await fetch(`/api/public/${tenantSlug}/confirm`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Idempotency-Key": confirmKey },
-        body: JSON.stringify(confirmPayload)
-      });
-      const confirmTxt = await confirmRes.text();
-      if (!confirmRes.ok) {
-        setErr(`予約確定に失敗しました: ${confirmRes.status} ${confirmTxt}`);
-        setSubmitting(false);
-        return;
-      }
-
-      setDone(JSON.parse(confirmTxt) as ConfirmResp);
+      JSON.parse(verifyTxt) as VerifyResp;
+      setAwaitingEmail(true);
       setSubmitting(false);
     } catch (e) {
       setErr(`予約に失敗しました。別の時間を選んでください。 (${e instanceof Error ? e.message : String(e)})`);
@@ -160,11 +228,42 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
     );
   }
 
+  if (token) {
+    return (
+      <div className="mx-auto max-w-2xl p-6 space-y-6">
+        <h1 className="text-2xl font-semibold">予約確認</h1>
+        <p className="rounded border p-3 text-sm">
+          {submitting
+            ? "予約を確認しています..."
+            : awaitingEmail
+              ? "確認メールを再送しました。新しいメール内のリンクをご利用ください。"
+              : "メール内の確認リンクを処理しています。"}
+        </p>
+        {err ? <pre className="rounded border p-3 text-sm text-red-700 whitespace-pre-wrap">{err}</pre> : null}
+        {confirmRetryable && storedBookingId ? (
+          <button
+            className="rounded bg-black text-white px-4 py-2 disabled:opacity-50"
+            disabled={submitting}
+            onClick={resendVerificationEmail}
+            type="button"
+          >
+            確認メールを再送する
+          </button>
+        ) : null}
+      </div>
+    );
+  }
+
   return (
     <div className="mx-auto max-w-2xl p-6 space-y-6">
       <h1 className="text-2xl font-semibold">予約フォーム ({tenantSlug})</h1>
 
       {err && <pre className="rounded border p-3 text-sm text-red-700 whitespace-pre-wrap">{err}</pre>}
+      {awaitingEmail ? (
+        <p className="rounded border p-3 text-sm">
+          確認メールを送信しました。メール内のリンクから予約を確定してください。
+        </p>
+      ) : null}
 
       <section className="space-y-2">
         <label className="block">

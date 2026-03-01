@@ -86,7 +86,7 @@ pnpm -C apps/api db:seed
 - `GET /v1/public/:tenantSlug/availability?date=YYYY-MM-DD`
 - `POST /v1/public/:tenantSlug/holds`
 - `POST /v1/public/:tenantSlug/auth/verify-email`
-- `POST /v1/public/:tenantSlug/confirm`
+- `POST /v1/public/:tenantSlug/confirm` (token only)
 - `POST /v1/public/:tenantSlug/bookings/:bookingId/cancel`
 - `POST /v1/public/:tenantSlug/bookings/:bookingId/reschedule`
 
@@ -110,6 +110,7 @@ This script runs:
 Run:
 
 ```bash
+# For dev/smoke token extraction, start the API with PUBLIC_RETURN_VERIFY_TOKEN=1
 sed -i 's/\r$//' scripts/smoke_public_flow_safe.sh
 chmod +x scripts/smoke_public_flow_safe.sh
 bash scripts/smoke_public_flow_safe.sh

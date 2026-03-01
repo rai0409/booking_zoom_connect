@@ -3,6 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 set -a; source .env; set +a
+export PUBLIC_RETURN_VERIFY_TOKEN=1
 
 TENANT="${TENANT:-acme}"
 SALESPERSON_ID="${SALESPERSON_ID:-b806673d-144e-448d-ab4f-ce91885f48e8}"
