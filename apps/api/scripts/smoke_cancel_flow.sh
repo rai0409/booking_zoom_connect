@@ -18,6 +18,7 @@ SALESPERSON_ID="${SALESPERSON_ID:?Set SALESPERSON_ID}"
 DATE="${DATE:-$(date +%F)}" # yyyy-mm-dd
 CUSTOMER_EMAIL="${CUSTOMER_EMAIL:-smoke+$(date +%s)@example.com}"
 CUSTOMER_NAME="${CUSTOMER_NAME:-Smoke Cancel}"
+export PUBLIC_RETURN_VERIFY_TOKEN=1
 
 require() { command -v "$1" >/dev/null 2>&1 || { echo "missing command: $1" >&2; exit 1; }; }
 require curl

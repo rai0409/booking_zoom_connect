@@ -51,10 +51,10 @@ export class PublicController {
     @Body() body: { token?: string; booking_id?: string }
   ) {
     if (body.booking_id) {
-      return this.bookingService.confirmBookingPublicById(tenantSlug, body.booking_id, idempotencyKey);
+      throw new BadRequestException("token required (booking_id confirm is not supported)");
     }
     if (!body.token) {
-      throw new BadRequestException("token or booking_id required");
+      throw new BadRequestException("token required");
     }
     return this.bookingService.confirmBookingPublic(tenantSlug, body.token, idempotencyKey);
   }

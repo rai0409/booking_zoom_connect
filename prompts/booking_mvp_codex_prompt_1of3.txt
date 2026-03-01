@@ -22,6 +22,7 @@ Assume frequent manual changes in Outlook; keep synchronization via Microsoft Gr
   - Email verification + auxiliary emails = Graph sendMail from a shared mailbox.
 - Meetings: Zoom (paid assumed). Zoom meetings are created under OUR Zoom org host (customer does not connect their Zoom).
 - Booking finalization: only after customer clicks email verification link.
+- Public confirm is token-only via `/public/:tenantSlug?token=<JWT>`.
 - Cancel/reschedule: customer self-service with deadline (default: allowed until 24h before start).
 - Attendance: salesperson records attended/no_show via one-click endpoint (auto meeting logs deferred).
 - Scale: ~15 salespersons, up to 30 bookings/day, peak 10–20/hour, retention 1 year.
