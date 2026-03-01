@@ -491,6 +491,18 @@ export class BookingService {
           params.startIso,
           params.endIso
         );
+        if (process.env.GRAPH_BUSY_DEBUG === "1") {
+          log("info", "availability_graph_busy_debug", {
+            tenantSlug: params.tenantSlug,
+            tenantId: params.tenantId,
+            salespersonId: salesperson.id,
+            graphUserId: salesperson.graph_user_id,
+            startIso: params.startIso,
+            endIso: params.endIso,
+            busyCount: busy.length,
+            sample: busy.slice(0, 5)
+          });
+        }
         busyBySalesperson.set(salesperson.id, busy);
       } catch (e) {
         log("warn", "availability_graph_busy_fetch_failed", {

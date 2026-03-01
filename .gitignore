@@ -62,3 +62,6 @@ apps/web/tsconfig.tsbuildinfo
 # local artifacts / backups
 _local_artifacts/
 *.bak_*
+
+# generated
+outputs/
