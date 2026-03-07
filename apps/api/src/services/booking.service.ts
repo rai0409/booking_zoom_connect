@@ -470,8 +470,9 @@ export class BookingService {
     return tenant;
   }
 
-  async getAvailabilityPublic(tenantSlug: string, salespersonId: string | undefined, date: string) {
+  async getAvailabilityPublic(tenantSlug: string, salespersonId: string | undefined, date: string, requestId?: string) {
     await this.getPublicTenantOrThrow(tenantSlug);
+    log("info", "availability_requested", { tenantSlug, requestId, salespersonId: salespersonId ?? null, date });
     return this.getAvailability(tenantSlug, salespersonId, date);
   }
 
@@ -494,10 +495,11 @@ export class BookingService {
       public_notes?: string;
       customer: { email: string; name?: string; company?: string };
     },
-    idempotencyKey: string
+    idempotencyKey: string,
+    requestId?: string
   ): Promise<PublicHoldResponse> {
     await this.getPublicTenantOrThrow(tenantSlug);
-    const booking = await this.createHold(tenantSlug, payload, idempotencyKey);
+    const booking = await this.createHold(tenantSlug, payload, idempotencyKey, requestId);
     let publicConfirmToken = await this.readPublicConfirmToken(prisma, booking.id);
     if (!publicConfirmToken) {
       publicConfirmToken = this.generatePublicConfirmToken();
@@ -514,30 +516,31 @@ export class BookingService {
     };
   }
 
-  async sendVerificationPublic(tenantSlug: string, bookingId: string, idempotencyKey: string) {
+  async sendVerificationPublic(tenantSlug: string, bookingId: string, idempotencyKey: string, requestId?: string) {
     await this.getPublicTenantOrThrow(tenantSlug);
-    const result = await this.sendVerification(tenantSlug, bookingId, idempotencyKey);
+    const result = await this.sendVerification(tenantSlug, bookingId, idempotencyKey, requestId);
     if (process.env.PUBLIC_RETURN_VERIFY_TOKEN === "1") {
       return result;
     }
     return { status: result.status };
   }
 
-  async confirmBookingPublic(tenantSlug: string, token: string, idempotencyKey: string) {
+  async confirmBookingPublic(tenantSlug: string, token: string, idempotencyKey: string, requestId?: string) {
     const tenant = await this.getPublicTenantOrThrow(tenantSlug);
-    const booking = await this.confirmBooking(tenantSlug, token, idempotencyKey);
+    const booking = await this.confirmBooking(tenantSlug, token, idempotencyKey, requestId);
     if (!booking) throw new NotFoundException("Booking not found");
     const links = this.buildCustomerActionLinks(tenantSlug, booking.id, tenant.id, booking.start_at_utc);
     return { status: "confirmed", booking_id: booking.id, cancel_url: links.cancelUrl, reschedule_url: links.rescheduleUrl };
   }
-  async confirmBookingPublicById(tenantSlug: string, bookingId: string, token: string, idempotencyKey: string) {
+  async confirmBookingPublicById(tenantSlug: string, bookingId: string, token: string, idempotencyKey: string, requestId?: string) {
     await this.getPublicTenantOrThrow(tenantSlug);
-    const booking = await this.confirmBookingById(tenantSlug, bookingId, token, idempotencyKey);
+    const booking = await this.confirmBookingById(tenantSlug, bookingId, token, idempotencyKey, requestId);
     if (!booking) throw new NotFoundException("Booking not found");
     return { status: "ok", booking };
   }
 
-  async confirmBookingById(tenantSlug: string, bookingId: string, token: string, idempotencyKey: string) {
+  async confirmBookingById(tenantSlug: string, bookingId: string, token: string, idempotencyKey: string, requestId?: string) {
+    log("info", "confirm_by_id_requested", { tenantSlug, bookingId, requestId });
     const tenant = await prisma.tenant.findUnique({ where: { slug: tenantSlug } });
     if (!tenant) throw new NotFoundException("Tenant not found");
     if (!idempotencyKey) throw new BadRequestException("Idempotency-Key required");
@@ -611,9 +614,9 @@ export class BookingService {
 
 
 
-  async cancelBookingPublic(tenantSlug: string, bookingId: string, token: string, idempotencyKey: string) {
+  async cancelBookingPublic(tenantSlug: string, bookingId: string, token: string, idempotencyKey: string, requestId?: string) {
     await this.getPublicTenantOrThrow(tenantSlug);
-    return this.cancelBooking(tenantSlug, bookingId, token, idempotencyKey);
+    return this.cancelBooking(tenantSlug, bookingId, token, idempotencyKey, requestId);
   }
 
   async rescheduleBookingPublic(
@@ -621,10 +624,11 @@ export class BookingService {
     bookingId: string,
     token: string,
     payload: { new_start_at: string; new_end_at: string },
-    idempotencyKey: string
+    idempotencyKey: string,
+    requestId?: string
   ) {
     await this.getPublicTenantOrThrow(tenantSlug);
-    return this.rescheduleBooking(tenantSlug, bookingId, token, payload, idempotencyKey);
+    return this.rescheduleBooking(tenantSlug, bookingId, token, payload, idempotencyKey, requestId);
   }
 
   private verifyBookingTokenOrThrow(token: string, expiredMsg = "token expired") {
@@ -917,11 +921,13 @@ export class BookingService {
       public_notes?: string;
       customer: { email: string; name?: string; company?: string };
     },
-    idempotencyKey: string
+    idempotencyKey: string,
+    requestId?: string
   ) {
     if (!idempotencyKey) throw new BadRequestException("Idempotency-Key required");
     const tenant = await prisma.tenant.findUnique({ where: { slug: tenantSlug } });
     if (!tenant) throw new NotFoundException("Tenant not found");
+    log("info", "hold_requested", { tenantSlug, requestId, salespersonId: payload.salesperson_id ?? null });
 
     const startAt = parseIsoToUtc(payload.start_at);
     const endAt = parseIsoToUtc(payload.end_at);
@@ -1066,10 +1072,11 @@ export class BookingService {
     return booking;
   }
 
-  async sendVerification(tenantSlug: string, bookingId: string, idempotencyKey: string) {
+  async sendVerification(tenantSlug: string, bookingId: string, idempotencyKey: string, requestId?: string) {
     if (!idempotencyKey) throw new BadRequestException("Idempotency-Key required");
     const tenant = await prisma.tenant.findUnique({ where: { slug: tenantSlug } });
     if (!tenant) throw new NotFoundException("Tenant not found");
+    log("info", "verify_email_requested", { tenantSlug, bookingId, requestId });
 
     const existing = await this.checkIdempotency(tenant.id, "verify-email", idempotencyKey);
     if (existing) {
@@ -1138,11 +1145,12 @@ export class BookingService {
         log("warn", "verify_email_send_failed", {
           tenantSlug,
           bookingId: booking.id,
+          requestId,
           err: e instanceof Error ? e.message : String(e)
         });
       }
     } else {
-      log("info", "verify_email_send_skipped", { tenantSlug, bookingId: booking.id, graphEnabled });
+      log("info", "verify_email_send_skipped", { tenantSlug, bookingId: booking.id, graphEnabled, requestId });
     }
 
 
@@ -1216,10 +1224,11 @@ export class BookingService {
     }
   }
 
-  async confirmBooking(tenantSlug: string, token: string, idempotencyKey: string) {
+  async confirmBooking(tenantSlug: string, token: string, idempotencyKey: string, requestId?: string) {
     if (!idempotencyKey) throw new BadRequestException("Idempotency-Key required");
     const tenant = await prisma.tenant.findUnique({ where: { slug: tenantSlug } });
     if (!tenant) throw new NotFoundException("Tenant not found");
+    log("info", "confirm_requested", { tenantSlug, requestId });
 
     const tokenPayload = this.verifyBookingTokenOrThrow(token, "Hold expired");
     if (tokenPayload.purpose !== "verify") throw new ForbiddenException("Invalid token purpose");
@@ -1238,6 +1247,7 @@ export class BookingService {
     if (booking.verify_token_jti !== tokenPayload.jti) {
       log("warn", "confirm_rejected", {
         tenantSlug,
+        requestId,
         bookingId: booking.id,
         bookingStatus: booking.status,
         verifyTokenJti: booking.verify_token_jti,
@@ -1255,6 +1265,7 @@ export class BookingService {
     if (booking.status !== BookingStatus.pending_verify) {
       log("warn", "confirm_rejected", {
         tenantSlug,
+        requestId,
         bookingId: booking.id,
         bookingStatus: booking.status,
         verifyTokenJti: booking.verify_token_jti,
@@ -1267,6 +1278,7 @@ export class BookingService {
     if (booking.hold && booking.hold.expires_at_utc <= utcNow()) {
       log("warn", "confirm_rejected", {
         tenantSlug,
+        requestId,
         bookingId: booking.id,
         bookingStatus: booking.status,
         verifyTokenJti: booking.verify_token_jti,
@@ -1422,10 +1434,11 @@ export class BookingService {
     }
   }
 
-  async cancelBooking(tenantSlug: string, bookingId: string, token: string, idempotencyKey: string) {
+  async cancelBooking(tenantSlug: string, bookingId: string, token: string, idempotencyKey: string, requestId?: string) {
     if (!idempotencyKey) throw new BadRequestException("Idempotency-Key required");
     const tenant = await prisma.tenant.findUnique({ where: { slug: tenantSlug } });
     if (!tenant) throw new NotFoundException("Tenant not found");
+    log("info", "cancel_requested", { tenantSlug, bookingId, requestId });
 
     const booking = await prisma.booking.findFirst({
       where: { id: bookingId, tenant_id: tenant.id },
@@ -1472,6 +1485,7 @@ export class BookingService {
       log("warn", "cancel_graph_delete_failed", {
         tenantSlug,
         bookingId: booking.id,
+        requestId,
         err: e instanceof Error ? e.message : String(e),
       });
     }
@@ -1483,6 +1497,7 @@ export class BookingService {
       log("warn", "cancel_zoom_delete_failed", {
         tenantSlug,
         bookingId: booking.id,
+        requestId,
         err: e instanceof Error ? e.message : String(e),
       });
     }
@@ -1496,11 +1511,13 @@ export class BookingService {
     bookingId: string,
     token: string,
     payload: { new_start_at: string; new_end_at: string },
-    idempotencyKey: string
+    idempotencyKey: string,
+    requestId?: string
   ) {
     if (!idempotencyKey) throw new BadRequestException("Idempotency-Key required");
     const tenant = await prisma.tenant.findUnique({ where: { slug: tenantSlug } });
     if (!tenant) throw new NotFoundException("Tenant not found");
+    log("info", "reschedule_requested", { tenantSlug, bookingId, requestId });
 
     if (!token) throw new BadRequestException("token required");
     const tokenPayload = this.verifyBookingTokenOrThrow(token);

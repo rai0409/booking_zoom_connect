@@ -45,6 +45,8 @@ model Salesperson {
   tenant              Tenant              @relation(fields: [tenant_id], references: [id])
   webhook_jobs        WebhookJob[]
 
+  @@unique([tenant_id, graph_user_id])
+  @@index([tenant_id, active])
   @@map("salespersons")
 }
 
