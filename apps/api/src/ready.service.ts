@@ -20,6 +20,8 @@ export class ReadyService {
 
     // 1) 必須 env
     const graphEnabled = (process.env.GRAPH_ENABLED ?? "0") !== "0";
+    const graphMock = (process.env.GRAPH_MOCK ?? "false").toLowerCase() === "true";
+    const queueDriver = (process.env.QUEUE_DRIVER ?? "memory").toLowerCase();
 
     const requiredEnvs = csv(
       "READY_REQUIRED_ENVS",
@@ -27,17 +29,31 @@ export class ReadyService {
       "DATABASE_URL,JWT_SECRET,ADMIN_API_KEY",
     );
 
-    const requiredEnvsGraph = csv("READY_REQUIRED_ENVS_GRAPH", "TENANT_ID,CLIENT_ID,CLIENT_SECRET");
+    const requiredEnvsGraph = csv("READY_REQUIRED_ENVS_GRAPH", "MS_CLIENT_ID,MS_CLIENT_SECRET,MS_SHARED_MAILBOX");
+    const requiredEnvsServiceBus = csv(
+      "READY_REQUIRED_ENVS_SERVICEBUS",
+      "SERVICEBUS_CONNECTION,SERVICEBUS_QUEUE_NAME"
+    );
 
     for (const k of requiredEnvs) {
       checks[`env:${k}`] = process.env[k] ? { ok: true } : { ok: false, detail: "missing" };
     }
-    if (graphEnabled) {
+    if (graphEnabled && !graphMock) {
       for (const k of requiredEnvsGraph) {
         checks[`env:${k}`] = process.env[k] ? { ok: true } : { ok: false, detail: "missing" };
       }
+    } else if (graphEnabled && graphMock) {
+      checks["env:graph_required_skipped"] = { ok: true, detail: "GRAPH_MOCK=true" };
     } else {
       checks["env:graph_required_skipped"] = { ok: true, detail: "GRAPH_ENABLED=0" };
+    }
+
+    if (queueDriver === "servicebus") {
+      for (const k of requiredEnvsServiceBus) {
+        checks[`env:${k}`] = process.env[k] ? { ok: true } : { ok: false, detail: "missing" };
+      }
+    } else {
+      checks["env:servicebus_required_skipped"] = { ok: true, detail: `QUEUE_DRIVER=${queueDriver}` };
     }
 
     // 2) DB 接続 + schema(必須テーブル/カラム)

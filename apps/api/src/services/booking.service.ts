@@ -2,13 +2,15 @@ import { Injectable, BadRequestException, ConflictException, ForbiddenException,
 import { Prisma, BookingStatus } from "@prisma/client";
 import { GraphClient } from "../clients/graph.client";
 import { config } from "../config";
+import { GraphMailSender } from "../mail/graph-mail-sender";
+import { MailSender } from "../mail/mail-sender";
 import { ZoomClient } from "../clients/zoom.client";
 import { prisma } from "../prisma";
 import { parseIsoToUtc, utcNow, toIsoUtc, dateFromYmdLocal } from "../utils/time";
 import { signBookingToken, verifyBookingToken, TokenPurpose } from "../utils/jwt";
 import { DateTime } from "luxon";
 import { log } from "../utils/logger";
-import { randomUUID } from "crypto";
+import { randomBytes, randomUUID } from "crypto";
 
 const HOLD_TTL_MINUTES = 10;
 const CANCEL_DEADLINE_HOURS = 24;
@@ -27,6 +29,8 @@ type AvailabilityContext = {
 };
 
 type PublicHoldResponse = {
+  booking_id: string;
+  public_confirm_token: string;
   id: string;
   status: BookingStatus;
   start_at_utc: string;
@@ -54,6 +58,7 @@ type InternalBookingListItem = {
 export class BookingService {
   private graph = new GraphClient();
   private zoom = new ZoomClient();
+  private mailSender: MailSender = new GraphMailSender(this.graph);
   private availabilityCache = new Map<string, { expiresAt: number; slots: AvailabilitySlot[] }>();
   private readonly logger = new Logger(BookingService.name);
   private static readonly UNION_SCOPE = "__union__";
@@ -218,6 +223,125 @@ export class BookingService {
     return oneLine ? oneLine.slice(0, 500) : null;
   }
 
+  private generatePublicConfirmToken() {
+    return randomBytes(16).toString("hex");
+  }
+
+  private async readPublicConfirmToken(client: any, bookingId: string): Promise<string | null> {
+    const rows = await client.$queryRaw<Array<{ public_confirm_token: string | null }>>`
+      SELECT "public_confirm_token"
+      FROM "bookings"
+      WHERE "id" = ${bookingId}::uuid
+      LIMIT 1
+    `;
+    return rows[0]?.public_confirm_token ?? null;
+  }
+
+  private async writePublicConfirmToken(client: any, bookingId: string, token: string | null) {
+    await client.$executeRaw`
+      UPDATE "bookings"
+      SET "public_confirm_token" = ${token}
+      WHERE "id" = ${bookingId}::uuid
+    `;
+  }
+
+  private async ensureGraphEventForConfirmedBookingBestEffort(params: {
+    tenantSlug: string;
+    tenant: { id: string; m365_tenant_id: string | null };
+    booking: {
+      id: string;
+      start_at_utc: Date;
+      end_at_utc: Date;
+      customer: { email: string };
+      salesperson: { graph_user_id: string | null; timezone: string };
+      graph_event: { event_id: string } | null;
+    };
+  }) {
+    if (process.env.GRAPH_ENABLED === "0") return;
+    if (!params.tenant.m365_tenant_id || !params.booking.salesperson.graph_user_id) return;
+    if (params.booking.graph_event?.event_id) return;
+
+    try {
+      const created = await this.graph.createEvent(params.tenant.m365_tenant_id, {
+        organizerUserId: params.booking.salesperson.graph_user_id,
+        subject: this.buildEventSubject(),
+        startUtc: toIsoUtc(params.booking.start_at_utc),
+        endUtc: toIsoUtc(params.booking.end_at_utc),
+        timezone: params.booking.salesperson.timezone,
+        attendeeEmail: params.booking.customer.email,
+        body: this.buildEventBody(),
+        transactionId: `booking:${params.booking.id}`
+      });
+
+      await prisma.graphEvent.upsert({
+        where: { booking_id: params.booking.id },
+        create: {
+          booking_id: params.booking.id,
+          organizer_user_id: params.booking.salesperson.graph_user_id,
+          event_id: created.eventId,
+          iCalUId: created.iCalUId,
+          etag: created.etag,
+          updated_at: utcNow()
+        },
+        update: {
+          organizer_user_id: params.booking.salesperson.graph_user_id,
+          event_id: created.eventId,
+          iCalUId: created.iCalUId,
+          etag: created.etag,
+          updated_at: utcNow()
+        }
+      });
+    } catch (e) {
+      log("warn", "confirm_graph_create_failed", {
+        tenantSlug: params.tenantSlug,
+        bookingId: params.booking.id,
+        err: e instanceof Error ? e.message : String(e)
+      });
+    }
+  }
+
+  private async runPostConfirmBestEffort(tenantSlug: string, bookingId: string) {
+    const tenant = await prisma.tenant.findUnique({
+      where: { slug: tenantSlug },
+      select: { id: true, m365_tenant_id: true, public_location_text: true }
+    });
+    if (!tenant) return;
+
+    const booking = await prisma.booking.findFirst({
+      where: { id: bookingId, tenant_id: tenant.id },
+      include: {
+        customer: true,
+        salesperson: true,
+        meeting: true,
+        graph_event: true
+      }
+    });
+    if (!booking || !booking.customer || !booking.salesperson) return;
+
+    await this.ensureGraphEventForConfirmedBookingBestEffort({
+      tenantSlug,
+      tenant,
+      booking: {
+        id: booking.id,
+        start_at_utc: booking.start_at_utc,
+        end_at_utc: booking.end_at_utc,
+        customer: { email: booking.customer.email },
+        salesperson: {
+          graph_user_id: booking.salesperson.graph_user_id,
+          timezone: booking.salesperson.timezone
+        },
+        graph_event: booking.graph_event
+      }
+    });
+
+    await this.sendConfirmationEmailBestEffort({
+      tenantSlug,
+      tenant,
+      booking,
+      zoomJoinUrl: booking.meeting?.join_url ?? null
+    });
+  }
+
   private parseInternalDateParam(value: string | undefined, name: "from" | "to"): Date | undefined {
     if (!value) return undefined;
     const dt = DateTime.fromISO(value, { setZone: true });
@@ -374,7 +498,14 @@ export class BookingService {
   ): Promise<PublicHoldResponse> {
     await this.getPublicTenantOrThrow(tenantSlug);
     const booking = await this.createHold(tenantSlug, payload, idempotencyKey);
+    let publicConfirmToken = await this.readPublicConfirmToken(prisma, booking.id);
+    if (!publicConfirmToken) {
+      publicConfirmToken = this.generatePublicConfirmToken();
+      await this.writePublicConfirmToken(prisma, booking.id, publicConfirmToken);
+    }
     return {
+      booking_id: booking.id,
+      public_confirm_token: publicConfirmToken,
       id: booking.id,
       status: booking.status,
       start_at_utc: toIsoUtc(booking.start_at_utc),
@@ -399,45 +530,83 @@ export class BookingService {
     const links = this.buildCustomerActionLinks(tenantSlug, booking.id, tenant.id, booking.start_at_utc);
     return { status: "confirmed", booking_id: booking.id, cancel_url: links.cancelUrl, reschedule_url: links.rescheduleUrl };
   }
-  async confirmBookingPublicById(tenantSlug: string, bookingId: string, idempotencyKey: string) {
-    const tenant = await this.getPublicTenantOrThrow(tenantSlug);
-    const booking = await this.confirmBookingById(tenantSlug, bookingId, idempotencyKey);
+  async confirmBookingPublicById(tenantSlug: string, bookingId: string, token: string, idempotencyKey: string) {
+    await this.getPublicTenantOrThrow(tenantSlug);
+    const booking = await this.confirmBookingById(tenantSlug, bookingId, token, idempotencyKey);
     if (!booking) throw new NotFoundException("Booking not found");
-    const links = this.buildCustomerActionLinks(tenantSlug, booking.id, tenant.id, booking.start_at_utc);
-    return { status: "confirmed", booking_id: booking.id, cancel_url: links.cancelUrl, reschedule_url: links.rescheduleUrl };
+    return { status: "ok", booking };
   }
 
-  async confirmBookingById(tenantSlug: string, bookingId: string, idempotencyKey: string) {
+  async confirmBookingById(tenantSlug: string, bookingId: string, token: string, idempotencyKey: string) {
     const tenant = await prisma.tenant.findUnique({ where: { slug: tenantSlug } });
     if (!tenant) throw new NotFoundException("Tenant not found");
+    if (!idempotencyKey) throw new BadRequestException("Idempotency-Key required");
+    if (!token) throw new BadRequestException("token required");
+
+    const existing = await this.checkIdempotency(tenant.id, "confirm-by-id", idempotencyKey);
+    if (existing) {
+      return prisma.booking.findFirst({ where: { id: bookingId, tenant_id: tenant.id } });
+    }
 
     const booking = await prisma.booking.findFirst({
       where: { id: bookingId, tenant_id: tenant.id },
-      select: { id: true, status: true, verify_token_jti: true, start_at_utc: true }
+      select: {
+        id: true,
+        status: true,
+        created_at: true
+      }
     });
     if (!booking) return null;
+    const publicConfirmToken = await this.readPublicConfirmToken(prisma, booking.id);
+    if (booking.status !== BookingStatus.hold) {
+      throw new ConflictException("Invalid booking state");
+    }
+    if (publicConfirmToken !== token) {
+      throw new BadRequestException("invalid public confirm token");
+    }
+    if (DateTime.fromJSDate(booking.created_at, { zone: "utc" }).plus({ minutes: 15 }).toMillis() <= Date.now()) {
+      throw new BadRequestException("public confirm token expired");
+    }
 
-    if (booking.status === BookingStatus.confirmed) {
-      return prisma.booking.findFirst({ where: { id: bookingId, tenant_id: tenant.id } });
-    }
-    if (booking.status === BookingStatus.canceled || booking.status === BookingStatus.expired) {
-      throw new ConflictException("Invalid booking state");
-    }
-    if (booking.status !== BookingStatus.hold && booking.status !== BookingStatus.pending_verify) {
-      throw new ConflictException("Invalid booking state");
-    }
+    const confirmed = await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${booking.id}))`;
 
-    if (!booking.verify_token_jti) {
-      throw new ConflictException("Invalid booking state");
-    }
-    const token = this.issueToken(
-      booking.id,
-      tenant.id,
-      "verify",
-      Math.floor(Date.now() / 1000) + 15 * 60,
-      booking.verify_token_jti
-    );
-    return this.confirmBooking(tenantSlug, token, idempotencyKey);
+      const latest = await tx.booking.findFirst({
+        where: { id: booking.id, tenant_id: tenant.id },
+        select: {
+          id: true,
+          status: true,
+          created_at: true
+        }
+      });
+      if (!latest) return null;
+      const latestPublicConfirmToken = await this.readPublicConfirmToken(tx, latest.id);
+      if (latest.status !== BookingStatus.hold) {
+        throw new ConflictException("Invalid booking state");
+      }
+      if (latestPublicConfirmToken !== token) {
+        throw new BadRequestException("invalid public confirm token");
+      }
+      if (DateTime.fromJSDate(latest.created_at, { zone: "utc" }).plus({ minutes: 15 }).toMillis() <= Date.now()) {
+        throw new BadRequestException("public confirm token expired");
+      }
+
+      const updated = await tx.booking.update({
+        where: { id: booking.id },
+        data: {
+          status: BookingStatus.confirmed,
+          verify_token_jti: null
+        }
+      });
+      await this.writePublicConfirmToken(tx, booking.id, null);
+      await tx.hold.deleteMany({ where: { booking_id: booking.id } });
+      return updated;
+    });
+
+    if (!confirmed) return null;
+    await this.recordIdempotency(tenant.id, "confirm-by-id", idempotencyKey);
+    await this.runPostConfirmBestEffort(tenantSlug, confirmed.id);
+    return confirmed;
   }
 
 
@@ -959,7 +1128,8 @@ export class BookingService {
     if (graphEnabled && tenant.m365_tenant_id) {
       try {
         const verifyUrl = `${config.baseUrl}/public/${tenantSlug}?token=${encodeURIComponent(token)}`;
-        await this.graph.sendMail(tenant.m365_tenant_id, {
+        await this.mailSender.send({
+          m365TenantId: tenant.m365_tenant_id,
           to: booking.customer.email,
           subject: `Booking verification ${booking.id}`,
           body: `Please verify your booking: ${verifyUrl}`
@@ -998,15 +1168,12 @@ export class BookingService {
       this.logger.warn(
         `Confirmation email skipped: Graph unavailable for tenant=${params.tenant.id}, booking=${params.booking.id}`
       );
+      await prisma.booking.update({
+        where: { id: params.booking.id },
+        data: { customer_notify_required: true }
+      }).catch(() => {});
       return;
     }
-    if (!config.msSharedMailbox) {
-      this.logger.warn(
-        `Confirmation email skipped: MS_SHARED_MAILBOX missing for tenant=${params.tenant.id}, booking=${params.booking.id}`
-      );
-      return;
-    }
-
     const links = this.buildCustomerActionLinks(
       params.tenantSlug,
       params.booking.id,
@@ -1026,11 +1193,16 @@ export class BookingService {
     });
 
     try {
-      await this.graph.sendMail(params.tenant.m365_tenant_id, {
+      await this.mailSender.send({
+        m365TenantId: params.tenant.m365_tenant_id,
         to: params.booking.customer.email,
         subject: email.subject,
         body: email.body
       });
+      await prisma.booking.update({
+        where: { id: params.booking.id },
+        data: { customer_notify_required: false }
+      }).catch(() => {});
     } catch (e) {
       this.logger.warn(
         `Confirmation email failed: tenant=${params.tenant.id}, booking=${params.booking.id}, error=${
@@ -1194,6 +1366,7 @@ export class BookingService {
             verify_token_jti: null
           }
         });
+        await this.writePublicConfirmToken(tx, booking.id, null);
         await tx.hold.deleteMany({ where: { booking_id: booking.id } });
         return updated;
       });
@@ -1725,6 +1898,44 @@ export class BookingService {
       ...item,
       events: eventsByBooking.get(item.id) || []
     }));
+  }
+
+  async resendConfirmationEmails(tenantSlug: string, limit: number) {
+    const tenant = await prisma.tenant.findUnique({
+      where: { slug: tenantSlug },
+      select: { id: true, m365_tenant_id: true, public_location_text: true }
+    });
+    if (!tenant) throw new NotFoundException("Tenant not found");
+
+    const take = Math.max(1, Math.min(500, Math.floor(limit || 50)));
+    const bookings = await prisma.booking.findMany({
+      where: {
+        tenant_id: tenant.id,
+        status: BookingStatus.confirmed,
+        customer_notify_required: true
+      },
+      orderBy: { start_at_utc: "asc" },
+      take,
+      include: {
+        customer: true,
+        salesperson: true,
+        meeting: true
+      }
+    });
+
+    let processed = 0;
+    for (const booking of bookings) {
+      if (!booking.customer || !booking.salesperson) continue;
+      await this.sendConfirmationEmailBestEffort({
+        tenantSlug,
+        tenant,
+        booking,
+        zoomJoinUrl: booking.meeting?.join_url ?? null
+      });
+      processed += 1;
+    }
+
+    return { processed };
   }
 
   async expireHolds() {

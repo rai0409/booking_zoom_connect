@@ -57,6 +57,7 @@ cp .env.example .env
 - `ADMIN_API_KEY`
 - `BASE_URL=http://localhost:3000` (token issuer / links)
 - `NEXT_PUBLIC_API_BASE=http://localhost:4000` (web app -> API)
+- `API_BASE_URL=http://localhost:4000` (scripts/jobs -> API)
 
 ### Optional (integrations)
 
@@ -70,7 +71,8 @@ Microsoft Graph / Zoom are only required when you actually enable those paths.
   - Local mock: `ZOOM_MOCK=true`
 
 Queue:
-- `QUEUE_DRIVER=memory` (default)
+- `QUEUE_DRIVER=memory` (dev only)
+- `QUEUE_DRIVER=servicebus` (recommended for prod)
 - `SERVICEBUS_CONNECTION` and `SERVICEBUS_QUEUE_NAME` when using `QUEUE_DRIVER=servicebus`
 
 ## Seeding
@@ -137,8 +139,8 @@ Expected output:
 
 ## Entra ID (multi-tenant)
 
-- Admin consent flow starts at `GET /v1/tenants/connect`
-- Entra redirects to `GET /v1/tenants/callback`
+- Planned / 未実装: `GET /v1/tenants/connect` and `GET /v1/tenants/callback` are not provided in this snapshot.
+- For manual OAuth experiments, use `scripts/ms_auth_url.sh` and `scripts/ms_oauth_poc.sh`.
 - Required Microsoft Graph permissions (high-level): `Calendars.ReadWrite`, `MailboxSettings.Read`, `User.Read`, `offline_access`
 
 ## Zoom (Server-to-Server OAuth)

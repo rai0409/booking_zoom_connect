@@ -6,19 +6,26 @@ import { useSearchParams } from "next/navigation";
 type Slot = { start_at_utc: string; end_at_utc: string };
 
 type HoldResponse = {
-  id: string;
-  start_at_utc: string;
-  end_at_utc: string;
+  booking_id: string;
+  public_confirm_token: string;
 };
 
-type VerifyResponse = { status: string; token?: string };
+type ConfirmByIdResponse = {
+  status: string;
+  booking: {
+    id: string;
+    status: string;
+    start_at_utc?: string;
+    end_at_utc?: string;
+  };
+};
 type ErrorResponse = { message?: string };
 
 export default function BookingPage({ params }: { params: { tenantSlug: string } }) {
   const searchParams = useSearchParams();
   const salespersonId = searchParams.get("salesperson") || "";
   const date = searchParams.get("date") || new Date().toISOString().slice(0, 10);
-  const storageKey = useMemo(() => `public-booking:${params.tenantSlug}:booking_id`, [params.tenantSlug]);
+  const apiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:4000";
 
   const [slots, setSlots] = useState<Slot[]>([]);
   const [selectedSlot, setSelectedSlot] = useState<Slot | null>(null);
@@ -27,9 +34,8 @@ export default function BookingPage({ params }: { params: { tenantSlug: string }
   const [company, setCompany] = useState("");
   const [loadingSlots, setLoadingSlots] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [awaitingEmail, setAwaitingEmail] = useState(false);
   const [error, setError] = useState("");
-  const [verifyUrl, setVerifyUrl] = useState<string | null>(null);
+  const [done, setDone] = useState<ConfirmByIdResponse | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -88,8 +94,6 @@ export default function BookingPage({ params }: { params: { tenantSlug: string }
     }
 
     setSubmitting(true);
-    setAwaitingEmail(false);
-    setVerifyUrl(null);
     setError("");
 
     let hold: HoldResponse;
@@ -127,54 +131,41 @@ export default function BookingPage({ params }: { params: { tenantSlug: string }
       return;
     }
 
-    window.localStorage.setItem(storageKey, hold.id);
-
     try {
-      const verifyRes = await fetch(`/api/public/${params.tenantSlug}/verify-email`, {
+      const confirmRes = await fetch(`${apiBase}/v1/public/${params.tenantSlug}/confirm-by-id`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Idempotency-Key": crypto.randomUUID()
         },
-        body: JSON.stringify({ booking_id: hold.id })
+        body: JSON.stringify({
+          booking_id: hold.booking_id,
+          token: hold.public_confirm_token
+        })
       });
-      const verifyText = await verifyRes.text();
-      if (!verifyRes.ok) {
-        setError("確認メールの送信に失敗しました。再試行してください。");
+      const confirmText = await confirmRes.text();
+      if (!confirmRes.ok) {
+        setError("予約の確定に失敗しました。別の時間を選んでください。");
         setSubmitting(false);
         return;
       }
 
-      const verify = JSON.parse(verifyText) as VerifyResponse;
-      setVerifyUrl(
-        process.env.NODE_ENV !== "production" && verify.token
-          ? `/public/${encodeURIComponent(params.tenantSlug)}?token=${encodeURIComponent(verify.token)}`
-          : null
-      );
-      setAwaitingEmail(true);
+      setDone(JSON.parse(confirmText) as ConfirmByIdResponse);
     } catch {
-      setError("確認メールの送信に失敗しました。再試行してください。");
+      setError("予約の確定に失敗しました。別の時間を選んでください。");
     } finally {
       setSubmitting(false);
     }
   }
 
-  if (awaitingEmail) {
+  if (done) {
     return (
       <main className="mx-auto max-w-2xl p-6 space-y-6">
-        <h1 className="text-2xl font-semibold">確認メールを送信しました</h1>
+        <h1 className="text-2xl font-semibold">予約完了</h1>
+        <p className="rounded border p-3 text-sm">予約を受け付けました。</p>
         <p className="rounded border p-3 text-sm">
-          メールのリンクをクリックすると予約が確定します。届かない場合は迷惑メールフォルダもご確認ください。
+          Booking ID: {done.booking.id} / Status: {done.booking.status}
         </p>
-        <p className="rounded border p-3 text-sm">メール内リンクをクリックするとこのページで確定します</p>
-        {verifyUrl ? (
-          <p className="rounded border p-3 text-sm">
-            Dev verify link:{" "}
-            <a className="underline" href={verifyUrl}>
-              {verifyUrl}
-            </a>
-          </p>
-        ) : null}
       </main>
     );
   }
@@ -234,7 +225,7 @@ export default function BookingPage({ params }: { params: { tenantSlug: string }
           onClick={submitBooking}
           disabled={!holdPayload || !email.trim() || submitting}
         >
-          {submitting ? "送信中..." : "確認メールを送信する"}
+          {submitting ? "送信中..." : "予約を確定する"}
         </button>
       </section>
     </main>

@@ -59,6 +59,15 @@ export class PublicController {
     return this.bookingService.confirmBookingPublic(tenantSlug, body.token, idempotencyKey);
   }
 
+  @Post(":tenantSlug/confirm-by-id")
+  async confirmById(
+    @Param("tenantSlug") tenantSlug: string,
+    @Headers("Idempotency-Key") idempotencyKey: string,
+    @Body() body: { booking_id: string; token: string }
+  ) {
+    return this.bookingService.confirmBookingPublicById(tenantSlug, body.booking_id, body.token, idempotencyKey);
+  }
+
   @Post(":tenantSlug/bookings/:id/cancel")
   async cancel(
     @Param("tenantSlug") tenantSlug: string,
