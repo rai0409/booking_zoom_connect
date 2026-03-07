@@ -51,7 +51,7 @@ export function createPublicRateLimiter(opts?: {
 
     if (tail === "holds") {
       if (!check(req, tenantSlug, "holds", holdsMax)) return tooMany(res);
-    } else if (tail === "confirm") {
+    } else if (tail === "confirm" || tail === "confirm-by-id") {
       if (!check(req, tenantSlug, "confirm", confirmMax)) return tooMany(res);
     } else if (tail === "auth/verify-email") {
       if (!check(req, tenantSlug, "verify", verifyMax)) return tooMany(res);

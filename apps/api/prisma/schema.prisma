@@ -45,6 +45,8 @@ model Salesperson {
   tenant              Tenant              @relation(fields: [tenant_id], references: [id])
   webhook_jobs        WebhookJob[]
 
+  @@unique([tenant_id, graph_user_id])
+  @@index([tenant_id, active])
   @@map("salespersons")
 }
 
@@ -72,6 +74,7 @@ model Booking {
   status                     BookingStatus
   idempotency_key            String
   verify_token_jti           String?
+  public_confirm_token       String?
   created_at                 DateTime          @default(now()) @db.Timestamptz(6)
   updated_at                 DateTime          @updatedAt @db.Timestamptz(6)
   customer_reinvite_required Boolean           @default(false)

@@ -162,8 +162,25 @@ export class GraphClient {
     }
 
     const scheduleEmail = await this.resolveScheduleEmail(m365TenantId, userId);
-    if (!scheduleEmail) {
-      return [{ startUtc: startUtcIso, endUtc: endUtcIso }];
+    if (process.env.GRAPH_BUSY_DEBUG === "1") {
+      log("info", "graph_busy_getSchedule_inputs", {
+        m365TenantId,
+        userId,
+        scheduleEmail,
+        startUtcIso,
+        endUtcIso
+      });
+    }
+     if (!scheduleEmail) {
+      if (process.env.GRAPH_BUSY_DEBUG === "1") {
+        log("warn", "graph_busy_schedule_email_missing_treat_as_busy", {
+          m365TenantId,
+          userId,
+          startUtcIso,
+          endUtcIso
+        });
+      }
+      return [];
     }
 
     const body = {
@@ -172,11 +189,25 @@ export class GraphClient {
       endTime: { dateTime: this.isoNoZ(endUtcIso), timeZone: "UTC" },
       availabilityViewInterval: 60
     };
+    if (process.env.GRAPH_BUSY_DEBUG === "1") {
+      log("info", "graph_busy_getSchedule_request", {
+        userId,
+        scheduleEmail,
+        body
+      });
+    }
 
     const res = await this.graphFetch(m365TenantId, `/users/${encodeURIComponent(userId)}/calendar/getSchedule`, {
       method: "POST",
       body: JSON.stringify(body)
     });
+    if (process.env.GRAPH_BUSY_DEBUG === "1") {
+      const txt = await res.clone().text().catch(() => "");
+      log("info", "graph_busy_getSchedule_response", {
+        status: res.status,
+        bodyHead: txt.slice(0, 2000)
+      });
+    }
 
     if (!res.ok) {
       const txt = await res.text().catch(() => "");

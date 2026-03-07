@@ -1,5 +1,15 @@
-import { Body, Controller, Get, Headers, Inject, Param, Post, Query, BadRequestException } from "@nestjs/common";
+import { BadRequestException, Body, Controller, Get, Headers, Inject, Param, Post, Query, Req } from "@nestjs/common";
+import type { Request } from "express";
 import { BookingService } from "./services/booking.service";
+import { AvailabilityQueryDto } from "./dto/public/availability.query.dto";
+import { CreateHoldDto } from "./dto/public/create-hold.dto";
+import { VerifyEmailDto } from "./dto/public/verify-email.dto";
+import { ConfirmDto } from "./dto/public/confirm.dto";
+import { ConfirmByIdDto } from "./dto/public/confirm-by-id.dto";
+import { CancelBookingDto } from "./dto/public/cancel-booking.dto";
+import { RescheduleBookingDto } from "./dto/public/reschedule-booking.dto";
+import { log } from "./utils/logger";
+import type { RequestWithId } from "./middleware/request-id.middleware";
 
 @Controller("/v1/public")
 export class PublicController {
@@ -7,11 +17,13 @@ export class PublicController {
 
   @Get(":tenantSlug/availability")
   async availability(
+    @Req() req: Request,
     @Param("tenantSlug") tenantSlug: string,
-    @Query("salesperson") salespersonId: string | undefined,
-    @Query("date") date: string
+    @Query() query: AvailabilityQueryDto
   ) {
-    return this.bookingService.getAvailabilityPublic(tenantSlug, salespersonId, date);
+    const requestId = (req as RequestWithId).requestId;
+    log("info", "public_availability_request", { tenantSlug, requestId, salespersonId: query.salesperson, date: query.date });
+    return this.bookingService.getAvailabilityPublic(tenantSlug, query.salesperson, query.date, requestId);
   }
 
   @Get(":tenantSlug/salespersons")
@@ -21,64 +33,81 @@ export class PublicController {
 
   @Post(":tenantSlug/holds")
   async createHold(
+    @Req() req: Request,
     @Param("tenantSlug") tenantSlug: string,
     @Headers("Idempotency-Key") idempotencyKey: string,
-    @Body() body: {
-      salesperson_id?: string;
-      start_at: string;
-      end_at: string;
-      booking_mode?: string;
-      public_notes?: string;
-      customer: { email: string; name?: string; company?: string };
-    }
+    @Body() body: CreateHoldDto
   ) {
-    return this.bookingService.createHoldPublic(tenantSlug, body, idempotencyKey);
+    const requestId = (req as RequestWithId).requestId;
+    log("info", "public_hold_request", { tenantSlug, requestId });
+    return this.bookingService.createHoldPublic(tenantSlug, body, idempotencyKey, requestId);
   }
 
   @Post(":tenantSlug/auth/verify-email")
   async verifyEmail(
+    @Req() req: Request,
     @Param("tenantSlug") tenantSlug: string,
     @Headers("Idempotency-Key") idempotencyKey: string,
-    @Body() body: { booking_id: string }
+    @Body() body: VerifyEmailDto
   ) {
-    return this.bookingService.sendVerificationPublic(tenantSlug, body.booking_id, idempotencyKey);
+    const requestId = (req as RequestWithId).requestId;
+    log("info", "public_verify_email_request", { tenantSlug, requestId, bookingId: body.booking_id });
+    return this.bookingService.sendVerificationPublic(tenantSlug, body.booking_id, idempotencyKey, requestId);
   }
 
   @Post(":tenantSlug/confirm")
   async confirm(
+    @Req() req: Request,
     @Param("tenantSlug") tenantSlug: string,
     @Headers("Idempotency-Key") idempotencyKey: string,
-    @Body() body: { token?: string; booking_id?: string }
+    @Body() body: ConfirmDto
   ) {
-    if (body.booking_id) {
+    const requestId = (req as RequestWithId).requestId;
+    log("info", "public_confirm_request", { tenantSlug, requestId });
+    if (body.booking_id !== undefined) {
       throw new BadRequestException("token required (booking_id confirm is not supported)");
     }
-    if (!body.token) {
-      throw new BadRequestException("token required");
-    }
-    return this.bookingService.confirmBookingPublic(tenantSlug, body.token, idempotencyKey);
+    return this.bookingService.confirmBookingPublic(tenantSlug, body.token, idempotencyKey, requestId);
+  }
+
+  @Post(":tenantSlug/confirm-by-id")
+  async confirmById(
+    @Req() req: Request,
+    @Param("tenantSlug") tenantSlug: string,
+    @Headers("Idempotency-Key") idempotencyKey: string,
+    @Body() body: ConfirmByIdDto
+  ) {
+    const requestId = (req as RequestWithId).requestId;
+    log("info", "public_confirm_by_id_request", { tenantSlug, requestId, bookingId: body.booking_id });
+    return this.bookingService.confirmBookingPublicById(tenantSlug, body.booking_id, body.token, idempotencyKey, requestId);
   }
 
   @Post(":tenantSlug/bookings/:id/cancel")
   async cancel(
+    @Req() req: Request,
     @Param("tenantSlug") tenantSlug: string,
     @Param("id") bookingId: string,
     @Headers("Idempotency-Key") idempotencyKey: string,
-    @Body() body: { token: string }
+    @Body() body: CancelBookingDto
   ) {
-    return this.bookingService.cancelBookingPublic(tenantSlug, bookingId, body.token, idempotencyKey);
+    const requestId = (req as RequestWithId).requestId;
+    log("info", "public_cancel_request", { tenantSlug, requestId, bookingId });
+    return this.bookingService.cancelBookingPublic(tenantSlug, bookingId, body.token, idempotencyKey, requestId);
   }
 
   @Post(":tenantSlug/bookings/:id/reschedule")
   async reschedule(
+    @Req() req: Request,
     @Param("tenantSlug") tenantSlug: string,
     @Param("id") bookingId: string,
     @Headers("Idempotency-Key") idempotencyKey: string,
-    @Body() body: { token: string; new_start_at: string; new_end_at: string }
+    @Body() body: RescheduleBookingDto
   ) {
+    const requestId = (req as RequestWithId).requestId;
+    log("info", "public_reschedule_request", { tenantSlug, requestId, bookingId });
     return this.bookingService.rescheduleBookingPublic(tenantSlug, bookingId, body.token, {
       new_start_at: body.new_start_at,
       new_end_at: body.new_end_at
-    }, idempotencyKey);
+    }, idempotencyKey, requestId);
   }
 }
