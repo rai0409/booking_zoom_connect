@@ -3,26 +3,24 @@ set -euo pipefail
 
 TENANT_SLUG="${TENANT_SLUG:-acme}"
 API_BASE="${API_BASE:-http://localhost:4000}"
-ARTIFACT_DIR="${ARTIFACT_DIR:-}"
-
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${ENV_FILE:-$ROOT_DIR/.env}"
+RUN_ID="$(date +%Y%m%d_%H%M%S)"
+ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/artifacts/smoke_public_flow_safe/$RUN_ID}"
 
-WORKDIR="$(mktemp -d)"
-cleanup() {
-  if [[ -n "${ARTIFACT_DIR}" ]]; then
-    mkdir -p "$ARTIFACT_DIR"
-    cp -a "$WORKDIR/." "$ARTIFACT_DIR/" || true
-  fi
-}
-trap cleanup EXIT
+mkdir -p "$ARTIFACT_DIR"
+SUMMARY_FILE="$ARTIFACT_DIR/summary.txt"
+REQUEST_FILE="$ARTIFACT_DIR/request-ids.tsv"
+: > "$SUMMARY_FILE"
+: > "$REQUEST_FILE"
+printf 'step\thttp_code\tx_request_id\n' >> "$REQUEST_FILE"
+
 require() { command -v "$1" >/dev/null 2>&1 || { echo "missing command: $1" >&2; exit 1; }; }
 require curl
 require jq
 require date
 require sed
 
-# load env (ADMIN_API_KEY, etc.)
 if [[ -f "$ENV_FILE" ]]; then
   set -a
   # shellcheck disable=SC1090
@@ -37,301 +35,350 @@ if [[ -z "${ADMIN_API_KEY:-}" ]]; then
   exit 1
 fi
 
-# curl wrapper: always write headers/body/status
-http() {
-  # usage: http <name> <curl args...>
-  local name="$1"; shift
-  local hdr="$WORKDIR/$name.hdr"
-  local body="$WORKDIR/$name.res"
-  local code
-  code="$(curl -sS -D "$hdr" -o "$body" -w '%{http_code}' "$@")" || true
-  echo "$code" > "$WORKDIR/$name.code"
-  [[ "$code" =~ ^2 ]] || { echo "HTTP $code ($name)"; cat "$hdr" || true; cat "$body" || true; exit 1; }
+log() {
+  printf '[smoke-safe] %s\n' "$*" >&2
+  printf '%s\n' "$*" >> "$SUMMARY_FILE"
 }
-# -------- helpers --------
-get_token_from_url() {
-  # $1=url -> print token
-  printf '%s' "$1" | sed -n 's/.*[?&]token=\([^&]*\).*/\1/p'
+
+fail() {
+  log "ERROR: $*"
+  exit 1
+}
+
+header_value() {
+  local key="$1"
+  local hdr="$2"
+  awk -v k="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')" '
+    {
+      line=$0
+      gsub("\r", "", line)
+      split(line, a, ":")
+      h=tolower(a[1])
+      if (h==k) {
+        sub(/^[^:]*:[[:space:]]*/, "", line)
+        print line
+        exit
+      }
+    }
+  ' "$hdr"
+}
+
+record_step() {
+  local name="$1"
+  local code="$2"
+  local req_id="$3"
+  printf '%s\t%s\t%s\n' "$name" "$code" "$req_id" >> "$REQUEST_FILE"
+  log "step=$name http=$code x-request-id=${req_id:-N/A}"
+}
+
+http_call() {
+  local name="$1"
+  shift
+  local hdr="$ARTIFACT_DIR/$name.hdr"
+  local body="$ARTIFACT_DIR/$name.res"
+  local code
+
+  code="$(curl -sS -D "$hdr" -o "$body" -w '%{http_code}' "$@")" || code="000"
+  printf '%s' "$code" > "$ARTIFACT_DIR/$name.code"
+
+  local req_id
+  req_id="$(header_value "x-request-id" "$hdr" || true)"
+  printf '%s' "$req_id" > "$ARTIFACT_DIR/$name.request_id"
+  record_step "$name" "$code" "$req_id"
+
+  printf '%s' "$code"
+}
+
+expect_2xx() {
+  local code="$1"
+  local name="$2"
+  if [[ ! "$code" =~ ^2 ]]; then
+    log "HTTP failure at $name"
+    cat "$ARTIFACT_DIR/$name.hdr" || true
+    cat "$ARTIFACT_DIR/$name.res" || true
+    fail "$name failed (http=$code)"
+  fi
+}
+
+json_get() {
+  local file="$1"
+  local expr="$2"
+  jq -r "$expr" "$file"
+}
+
+fallback_salesperson_from_db() {
+  if ! command -v psql >/dev/null 2>&1; then
+    return 1
+  fi
+  if [[ -z "${DATABASE_URL:-}" ]]; then
+    return 1
+  fi
+
+  local db_url tenant_id sp_id
+  db_url="${DATABASE_URL%%\?schema=*}"
+  tenant_id="$(psql "$db_url" -Atc "select id from tenants where slug='${TENANT_SLUG}' limit 1;" 2>/dev/null || true)"
+  [[ -n "$tenant_id" ]] || return 1
+
+  sp_id="$(psql "$db_url" -Atc "select id from salespersons where tenant_id='${tenant_id}' and active=true order by display_name asc limit 1;" 2>/dev/null || true)"
+  [[ -n "$sp_id" ]] || return 1
+
+  printf '%s' "$sp_id"
 }
 
 pick_future_slot() {
-  # Choose a slot whose start_at_utc is >= now + 48h (in seconds).
-  local min_epoch
+  local salesperson_id="$1"
+  local min_epoch ymd code slot
   min_epoch="$(date -u -d '+48 hours' +%s)"
 
-  # Search next 7 days (business hours maxDaysAhead default is 7 in your code)
   for d in {0..7}; do
-    local ymd
     ymd="$(date -u -d "+$d days" +%F)"
-    local slots_json
-    slots_json="$(curl -sS "$API_BASE/v1/public/$TENANT_SLUG/availability?date=$ymd")"
+    code="$(http_call "availability_$d" "$API_BASE/v1/public/$TENANT_SLUG/availability?salesperson=$salesperson_id&date=$ymd")"
+    expect_2xx "$code" "availability_$d"
 
-    # take first slot that satisfies future condition
-    local slot
-    slot="$(echo "$slots_json" | jq -c --argjson min "$min_epoch" '
-      def to_epoch:
-        .start_at_utc
-        | sub("\\.[0-9]+Z$"; "Z")
-        | fromdateiso8601;
-      map(select(to_epoch >= $min)) | .[0] // empty
-    ')"
+    slot="$(jq -c --argjson min "$min_epoch" '
+      map(
+        select(
+          (.start_at_utc | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) >= $min
+        )
+      ) | .[0] // empty
+    ' "$ARTIFACT_DIR/availability_$d.res")"
 
     if [[ -n "$slot" ]]; then
-      echo "$slot"
+      printf '%s' "$slot"
       return 0
     fi
   done
 
-  echo ""  # not found
   return 1
 }
 
-echo "[1] pick future slot (>= now+48h) ..."
-SLOT="$(pick_future_slot || true)"
-if [[ -z "$SLOT" ]]; then
-  echo "No suitable slot found (>=48h). Try increasing tenant max_days_ahead or business hours." >&2
-  exit 1
+log "artifact_dir=$ARTIFACT_DIR"
+
+# Preflight
+expect_2xx "$(http_call health "$API_BASE/health")" "health"
+expect_2xx "$(http_call ready "$API_BASE/ready")" "ready"
+
+# Salesperson discovery: API first
+SP_SOURCE="api"
+SP_ID=""
+SALES_CODE="$(http_call salespersons "$API_BASE/v1/public/$TENANT_SLUG/salespersons")"
+expect_2xx "$SALES_CODE" "salespersons"
+
+if jq -e 'type=="array" and length>0' "$ARTIFACT_DIR/salespersons.res" >/dev/null 2>&1; then
+  SP_ID="$(json_get "$ARTIFACT_DIR/salespersons.res" '.[0].id // empty')"
 fi
 
-START="$(echo "$SLOT" | jq -r '.start_at_utc')"
-END="$(echo "$SLOT" | jq -r '.end_at_utc')"
-echo "START=$START"
-echo "END=$END"
+if [[ -z "$SP_ID" ]]; then
+  SP_SOURCE="db-fallback"
+  SP_ID="$(fallback_salesperson_from_db || true)"
+fi
 
+[[ -n "$SP_ID" ]] || fail "No salesperson found (API empty and DB fallback failed)"
+log "salesperson_source=$SP_SOURCE salesperson_id=$SP_ID"
+
+# booking1: hold -> verify -> confirm -> cancel
+SLOT="$(pick_future_slot "$SP_ID" || true)"
+[[ -n "$SLOT" ]] || fail "No slot found (>=48h). Check business hours / max_days_ahead / seed"
+
+START="$(printf '%s' "$SLOT" | jq -r '.start_at_utc')"
+END="$(printf '%s' "$SLOT" | jq -r '.end_at_utc')"
 EMAIL="smoke+safe-$(date +%s)@example.com"
 
-cat > /tmp/hold.json <<JSON
+cat > "$ARTIFACT_DIR/hold_payload.json" <<JSON
 {
+  "salesperson_id": "$SP_ID",
   "start_at": "$START",
   "end_at": "$END",
   "booking_mode": "online",
-  "public_notes": "相談: smoke test",
+  "public_notes": "smoke safe hold",
   "customer": { "email": "$EMAIL", "name": "Safe Smoke", "company": "Acme" }
 }
 JSON
 
-echo "[2] create hold ..."
-http hold -X POST \
+expect_2xx "$(http_call hold -X POST \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: smoke-hold-$(date +%s)" \
+  -H "Idempotency-Key: smoke-hold-$(date +%s%N)" \
   "$API_BASE/v1/public/$TENANT_SLUG/holds" \
-  --data-binary @/tmp/hold.json
-cat "$WORKDIR/hold.res" | jq .
-BOOKING_ID="$(jq -r '.id' "$WORKDIR/hold.res")"
+  --data-binary "@$ARTIFACT_DIR/hold_payload.json")" "hold"
 
-[[ -n "$BOOKING_ID" && "$BOOKING_ID" != "null" ]] || { echo "booking_id missing" >&2; exit 1; }
-echo "BOOKING_ID=$BOOKING_ID"
+BOOKING_ID="$(json_get "$ARTIFACT_DIR/hold.res" '.id // empty')"
+[[ -n "$BOOKING_ID" ]] || fail "booking_id missing in hold response"
 
-echo "[3] verify-email (get verify token) ..."
-http verify -X POST \
+expect_2xx "$(http_call verify -X POST \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: smoke-verify-$(date +%s%N)" \
   "$API_BASE/v1/public/$TENANT_SLUG/auth/verify-email" \
-  -d "{\"booking_id\":\"$BOOKING_ID\"}"
+  -d "{\"booking_id\":\"$BOOKING_ID\"}")" "verify"
 
-cat "$WORKDIR/verify.res" | jq .
-VERIFY_TOKEN="$(jq -r '.token' "$WORKDIR/verify.res")"
-[[ -n "$VERIFY_TOKEN" && "$VERIFY_TOKEN" != "null" ]] || { echo "verify token missing" >&2; exit 1; }
+VERIFY_TOKEN="$(json_get "$ARTIFACT_DIR/verify.res" '.token // empty')"
+[[ -n "$VERIFY_TOKEN" ]] || fail "verify token missing"
 
-echo "[4] confirm ..."
-http confirm -X POST \
+expect_2xx "$(http_call confirm -X POST \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: smoke-confirm-$(date +%s)" \
+  -H "Idempotency-Key: smoke-confirm-$(date +%s%N)" \
   "$API_BASE/v1/public/$TENANT_SLUG/confirm" \
-  -d "{\"token\":\"$VERIFY_TOKEN\"}"
+  -d "{\"token\":\"$VERIFY_TOKEN\"}")" "confirm"
 
-cat "$WORKDIR/confirm.res" | jq .
-CONF_STATUS="$(jq -r '.status' "$WORKDIR/confirm.res")"
-[[ "$CONF_STATUS" == "confirmed" ]] || { echo "confirm failed" >&2; exit 1; }
+[[ "$(json_get "$ARTIFACT_DIR/confirm.res" '.status // empty')" == "confirmed" ]] || fail "confirm did not return status=confirmed"
 
-echo "[5] internal links regenerate (reliable) ..."
-http links -H "x-admin-api-key: $ADMIN_API_KEY" \
-  "$API_BASE/v1/internal/$TENANT_SLUG/bookings/$BOOKING_ID/links"
-cat "$WORKDIR/links.res" | tee /tmp/links.json | jq .
+expect_2xx "$(http_call links -H "x-admin-api-key: $ADMIN_API_KEY" \
+  "$API_BASE/v1/internal/$TENANT_SLUG/bookings/$BOOKING_ID/links")" "links"
 
-CANCEL_URL="$(jq -r '.cancel_url' "$WORKDIR/links.res")"
-RESCH_URL="$(jq -r '.reschedule_url' "$WORKDIR/links.res")"
-CANCEL_TOKEN="$(get_token_from_url "$CANCEL_URL")"
-RESCH_TOKEN="$(get_token_from_url "$RESCH_URL")"
-echo "cancel_token_len=${#CANCEL_TOKEN}"
-echo "reschedule_token_len=${#RESCH_TOKEN}"
-[[ ${#CANCEL_TOKEN} -gt 50 ]] || { echo "cancel token parse failed" >&2; exit 1; }
-[[ ${#RESCH_TOKEN} -gt 50 ]] || { echo "reschedule token parse failed" >&2; exit 1; }
+CANCEL_URL="$(json_get "$ARTIFACT_DIR/links.res" '.cancel_url // empty')"
+RESCH_URL="$(json_get "$ARTIFACT_DIR/links.res" '.reschedule_url // empty')"
+CANCEL_TOKEN="$(printf '%s' "$CANCEL_URL" | sed -n 's/.*[?&]token=\([^&]*\).*/\1/p')"
+RESCH_TOKEN="$(printf '%s' "$RESCH_URL" | sed -n 's/.*[?&]token=\([^&]*\).*/\1/p')"
+[[ ${#CANCEL_TOKEN} -gt 50 ]] || fail "cancel token parse failed"
+[[ ${#RESCH_TOKEN} -gt 50 ]] || fail "reschedule token parse failed"
 
-echo "[6] cancel (should succeed because booking is >=48h ahead) ..."
-http cancel -X POST \
+expect_2xx "$(http_call cancel -X POST \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: smoke-cancel-$(date +%s)" \
+  -H "Idempotency-Key: smoke-cancel-$(date +%s%N)" \
   "$API_BASE/v1/public/$TENANT_SLUG/bookings/$BOOKING_ID/cancel" \
-  -d "{\"token\":\"$CANCEL_TOKEN\"}"
-cat "$WORKDIR/cancel.res" | jq .
+  -d "{\"token\":\"$CANCEL_TOKEN\"}")" "cancel"
 
-echo "[7] (optional) reschedule test:"
-echo "    reschedule works only for CONFIRMED bookings in your code."
-echo "    Since we just canceled, reschedule will conflict. So we create a SECOND booking and reschedule that."
-
-echo "[7-1] create second booking for reschedule ..."
-echo "[7-1a] pick initial slot for booking2 (different from booking1) ..."
-
+# booking2: hold -> verify -> confirm -> reschedule (with 409 retry)
 DATE1="$(date -u -d "$START" +%F)"
-YMD_NEXT="$(date -u -d "$DATE1 +1 day" +%F)"
+DATE2="$(date -u -d "$DATE1 +1 day" +%F)"
 
-CANDIDATES_JSON="$(curl -sS "$API_BASE/v1/public/$TENANT_SLUG/availability?date=$DATE1" \
-  | jq -c --arg start "$START" 'map(select(.start_at_utc != $start))')"
-if [[ -z "$CANDIDATES_JSON" || "$CANDIDATES_JSON" == "null" ]]; then
-  CANDIDATES_JSON="[]"
-fi
+expect_2xx "$(http_call availability_resched_same_day "$API_BASE/v1/public/$TENANT_SLUG/availability?salesperson=$SP_ID&date=$DATE1")" "availability_resched_same_day"
+expect_2xx "$(http_call availability_resched_next_day "$API_BASE/v1/public/$TENANT_SLUG/availability?salesperson=$SP_ID&date=$DATE2")" "availability_resched_next_day"
 
-# If same-day has too few slots, append next-day slots as fallback.
-NEXTDAY_JSON="$(curl -sS "$API_BASE/v1/public/$TENANT_SLUG/availability?date=$YMD_NEXT" | jq -c '.')"
-if [[ -n "$NEXTDAY_JSON" && "$NEXTDAY_JSON" != "null" ]]; then
-  CANDIDATES_JSON="$(jq -c --argjson a "$CANDIDATES_JSON" --argjson b "$NEXTDAY_JSON" '$a + $b' <<< 'null')"
-  # Above line uses jq for concatenation without relying on shell array behavior
-  CANDIDATES_JSON="$(jq -c --argjson a "$CANDIDATES_JSON" --argjson b "$NEXTDAY_JSON" '$a + $b' <<< "$CANDIDATES_JSON")"
-fi
+jq -c --arg start "$START" '
+  map(select(.start_at_utc != $start))
+' "$ARTIFACT_DIR/availability_resched_same_day.res" > "$ARTIFACT_DIR/resched_candidates_same_day.json"
 
-# Try up to 5 candidates until holds succeeds (409 -> next candidate).
+jq -c -s '.[0] + .[1]' \
+  "$ARTIFACT_DIR/resched_candidates_same_day.json" \
+  "$ARTIFACT_DIR/availability_resched_next_day.res" > "$ARTIFACT_DIR/resched_candidates_all.json"
+
 BOOKING2_ID=""
-SLOT2=""
-for i in 0 1 2 3 4; do
-  SLOT2="$(echo "$CANDIDATES_JSON" | jq -c ".[$i] // empty")"
-  if [[ -z "$SLOT2" ]]; then
-    break
-  fi
-  START2="$(echo "$SLOT2" | jq -r '.start_at_utc')"
-  END2="$(echo "$SLOT2" | jq -r '.end_at_utc')"
-  EMAIL2="smoke+safe2-$(date +%s%N)@example.com"
+OLD2_START=""
+OLD2_END=""
 
-  cat > /tmp/hold2.json <<JSON
+for i in 0 1 2 3 4; do
+  SLOT2="$(jq -c ".[$i] // empty" "$ARTIFACT_DIR/resched_candidates_all.json")"
+  [[ -n "$SLOT2" ]] || break
+
+  START2="$(printf '%s' "$SLOT2" | jq -r '.start_at_utc')"
+  END2="$(printf '%s' "$SLOT2" | jq -r '.end_at_utc')"
+
+  cat > "$ARTIFACT_DIR/hold2_payload_try_$((i+1)).json" <<JSON
 {
+  "salesperson_id": "$SP_ID",
   "start_at": "$START2",
   "end_at": "$END2",
   "booking_mode": "online",
-  "public_notes": "相談: smoke reschedule",
-  "customer": { "email": "$EMAIL2", "name": "Safe Smoke2", "company": "Acme" }
+  "public_notes": "smoke safe reschedule target",
+  "customer": { "email": "smoke+safe2-$(date +%s%N)@example.com", "name": "Safe Smoke2", "company": "Acme" }
 }
 JSON
 
-  curl -sS -D /tmp/hold2.hdr -o /tmp/hold2.res \
-    -X POST \
+  CODE2="$(http_call "hold2_try_$((i+1))" -X POST \
     -H "Content-Type: application/json" \
-    -H "Idempotency-Key: smoke-hold2-$(date +%s%N)" \
+    -H "Idempotency-Key: smoke-hold2-$((i+1))-$(date +%s%N)" \
     "$API_BASE/v1/public/$TENANT_SLUG/holds" \
-    --data-binary @/tmp/hold2.json >/dev/null || true
+    --data-binary "@$ARTIFACT_DIR/hold2_payload_try_$((i+1)).json")"
 
-  HOLD2_STATUS="$(head -n 1 /tmp/hold2.hdr 2>/dev/null || true)"
-  CODE2="$(echo "$HOLD2_STATUS" | awk '{print $2}')"
-
-  if [[ "$CODE2" == "201" ]]; then
-    BOOKING2_ID="$(jq -r '.id' /tmp/hold2.res)"
-    if [[ -n "$BOOKING2_ID" && "$BOOKING2_ID" != "null" ]]; then
-      echo "booking2 hold created (attempt=$i) START2=$START2 END2=$END2"
-      break
-    fi
+  if [[ "$CODE2" =~ ^2 ]]; then
+    BOOKING2_ID="$(json_get "$ARTIFACT_DIR/hold2_try_$((i+1)).res" '.id // empty')"
+    OLD2_START="$START2"
+    OLD2_END="$END2"
+    break
   fi
 
-  # If conflict, try next candidate.
   if [[ "$CODE2" == "409" ]]; then
-    echo "hold2 conflict (attempt=$i) START2=$START2 END2=$END2 -> retry next slot" >&2
+    log "hold2 conflict -> retry next candidate"
     continue
   fi
 
-  echo "hold2 failed (attempt=$i) status=$HOLD2_STATUS" >&2
-  cat /tmp/hold2.res >&2 || true
-  exit 1
+  fail "hold2 failed with http=$CODE2"
 done
 
-[[ -n "$BOOKING2_ID" && "$BOOKING2_ID" != "null" ]] || { echo "booking2_id missing (all candidates failed)" >&2; cat /tmp/hold2.res >&2 || true; exit 1; }
-curl -sS -o /tmp/verify2.res \
-  -X POST \
+[[ -n "$BOOKING2_ID" ]] || fail "booking2 creation failed after candidate retries"
+
+expect_2xx "$(http_call verify2 -X POST \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: smoke-verify2-$(date +%s%N)" \
   "$API_BASE/v1/public/$TENANT_SLUG/auth/verify-email" \
-  -d "{\"booking_id\":\"$BOOKING2_ID\"}"
-VERIFY2_TOKEN="$(jq -r '.token' /tmp/verify2.res)"
+  -d "{\"booking_id\":\"$BOOKING2_ID\"}")" "verify2"
 
-curl -sS -o /tmp/confirm2.res \
-  -X POST \
+VERIFY2_TOKEN="$(json_get "$ARTIFACT_DIR/verify2.res" '.token // empty')"
+[[ -n "$VERIFY2_TOKEN" ]] || fail "verify2 token missing"
+
+expect_2xx "$(http_call confirm2 -X POST \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: smoke-resched-$(date +%s%N)" \
+  -H "Idempotency-Key: smoke-confirm2-$(date +%s%N)" \
   "$API_BASE/v1/public/$TENANT_SLUG/confirm" \
-  -d "{\"token\":\"$VERIFY2_TOKEN\"}"
-CONF2_STATUS="$(jq -r '.status' /tmp/confirm2.res)"
-[[ "$CONF2_STATUS" == "confirmed" ]] || { echo "confirm2 failed" >&2; exit 1; }
+  -d "{\"token\":\"$VERIFY2_TOKEN\"}")" "confirm2"
 
-curl -sS -H "x-admin-api-key: $ADMIN_API_KEY" \
-  "$API_BASE/v1/internal/$TENANT_SLUG/bookings/$BOOKING2_ID/links" \
-  | tee /tmp/links2.json >/dev/null
+[[ "$(json_get "$ARTIFACT_DIR/confirm2.res" '.status // empty')" == "confirmed" ]] || fail "confirm2 did not return confirmed"
 
-RESCH2_URL="$(jq -r '.reschedule_url' /tmp/links2.json)"
-RESCH2_TOKEN="$(get_token_from_url "$(printf '%s' "$RESCH2_URL" | tr -d '\r')")"
-[[ ${#RESCH2_TOKEN} -gt 50 ]] || { echo "reschedule2 token parse failed" >&2; exit 1; }
+expect_2xx "$(http_call links2 -H "x-admin-api-key: $ADMIN_API_KEY" \
+  "$API_BASE/v1/internal/$TENANT_SLUG/bookings/$BOOKING2_ID/links")" "links2"
 
-# booking2 current slot (must differ from NEW slot)
-OLD2_START="$(echo "$SLOT2" | jq -r '.start_at_utc')"
-OLD2_END="$(echo "$SLOT2" | jq -r '.end_at_utc')"
-# pick a different future slot (availability-based) + retry on 409
-echo "[7-2] pick new slot for reschedule ..."
-RESCH_DATE="$(date -u -d "$OLD2_START" +%F)"
+RESCH2_URL="$(json_get "$ARTIFACT_DIR/links2.res" '.reschedule_url // empty')"
+RESCH2_TOKEN="$(printf '%s' "$RESCH2_URL" | sed -n 's/.*[?&]token=\([^&]*\).*/\1/p')"
+[[ ${#RESCH2_TOKEN} -gt 50 ]] || fail "reschedule2 token parse failed"
 
-  # gather candidate slots: same day (exclude old slot), then next day as fallback
-  CAND_SLOTS="$(curl -sS "$API_BASE/v1/public/$TENANT_SLUG/availability?date=$RESCH_DATE" \
-    | jq -c --arg os "$OLD2_START" --arg oe "$OLD2_END" '
-        map(select(.start_at_utc != $os or .end_at_utc != $oe))
-      ')"
+expect_2xx "$(http_call availability_reschedule_target "$API_BASE/v1/public/$TENANT_SLUG/availability?salesperson=$SP_ID&date=$(date -u -d "$OLD2_START" +%F)")" "availability_reschedule_target"
 
-  if [[ "$(echo "$CAND_SLOTS" | jq 'length')" -eq 0 ]]; then
-    YMD_NEXT="$(date -u -d "$RESCH_DATE +1 day" +%F)"
-    CAND_SLOTS="$(curl -sS "$API_BASE/v1/public/$TENANT_SLUG/availability?date=$YMD_NEXT" | jq -c 'map(.)')"
+jq -c --arg os "$OLD2_START" --arg oe "$OLD2_END" '
+  map(select(.start_at_utc != $os or .end_at_utc != $oe))
+' "$ARTIFACT_DIR/availability_reschedule_target.res" > "$ARTIFACT_DIR/reschedule_targets.json"
+
+if [[ "$(jq 'length' "$ARTIFACT_DIR/reschedule_targets.json")" -eq 0 ]]; then
+  NEXT_DATE="$(date -u -d "$(date -u -d "$OLD2_START" +%F) +1 day" +%F)"
+  expect_2xx "$(http_call availability_reschedule_target_next "$API_BASE/v1/public/$TENANT_SLUG/availability?salesperson=$SP_ID&date=$NEXT_DATE")" "availability_reschedule_target_next"
+  cp "$ARTIFACT_DIR/availability_reschedule_target_next.res" "$ARTIFACT_DIR/reschedule_targets.json"
+fi
+
+[[ "$(jq 'length' "$ARTIFACT_DIR/reschedule_targets.json")" -gt 0 ]] || fail "no candidate slot for reschedule"
+
+RESCHEDULE_OK=0
+for i in 0 1 2 3 4; do
+  TARGET="$(jq -c ".[$i] // empty" "$ARTIFACT_DIR/reschedule_targets.json")"
+  [[ -n "$TARGET" ]] || break
+
+  NEW_START="$(printf '%s' "$TARGET" | jq -r '.start_at_utc')"
+  NEW_END="$(printf '%s' "$TARGET" | jq -r '.end_at_utc')"
+
+  if [[ "$NEW_START" == "$OLD2_START" && "$NEW_END" == "$OLD2_END" ]]; then
+    continue
   fi
 
-  [[ "$(echo "$CAND_SLOTS" | jq 'length')" -gt 0 ]] || { echo "no alternative slot found for reschedule" >&2; exit 1; }
+  CODER="$(http_call "reschedule_try_$((i+1))" -X POST \
+    -H "Content-Type: application/json" \
+    -H "Idempotency-Key: smoke-reschedule-$((i+1))-$(date +%s%N)" \
+    "$API_BASE/v1/public/$TENANT_SLUG/bookings/$BOOKING2_ID/reschedule" \
+    -d "{\"token\":\"$RESCH2_TOKEN\",\"new_start_at\":\"$NEW_START\",\"new_end_at\":\"$NEW_END\"}")"
 
-  echo "[7-3] reschedule booking2 (retry on 409) ..."
-  RESCHEDULE_OK=0
-  MAX_TRY=5
+  if [[ "$CODER" =~ ^2 ]]; then
+    RESCHEDULE_OK=1
+    break
+  fi
 
-  for i in $(seq 0 $((MAX_TRY-1))); do
-    NEW_SLOT="$(echo "$CAND_SLOTS" | jq -c ".[$i] // empty")"
-    [[ -n "$NEW_SLOT" ]] || break
+  if [[ "$CODER" == "409" ]]; then
+    log "reschedule conflict -> retry next candidate"
+    continue
+  fi
 
-    NEW_START="$(echo "$NEW_SLOT" | jq -r '.start_at_utc')"
-    NEW_END="$(echo "$NEW_SLOT" | jq -r '.end_at_utc')"
+  fail "reschedule failed with http=$CODER"
+done
 
-    echo "TRY=$((i+1)) NEW_START=$NEW_START"
-    echo "TRY=$((i+1)) NEW_END=$NEW_END"
+[[ "$RESCHEDULE_OK" -eq 1 ]] || fail "reschedule failed after retry budget"
 
-    # no-op guard
-    if [[ "$NEW_START" == "$OLD2_START" && "$NEW_END" == "$OLD2_END" ]]; then
-      echo "skip no-op slot" >&2
-      continue
-    fi
+cat > "$ARTIFACT_DIR/final-summary.json" <<JSON
+{
+  "tenant_slug": "$TENANT_SLUG",
+  "salesperson_source": "$SP_SOURCE",
+  "salesperson_id": "$SP_ID",
+  "booking1_canceled": "$BOOKING_ID",
+  "booking2_rescheduled": "$BOOKING2_ID",
+  "artifact_dir": "$ARTIFACT_DIR"
+}
+JSON
 
-    CODE="$(curl -sS -D /tmp/reschedule.hdr -o /tmp/reschedule.res -w '%{http_code}' \
-      -X POST \
-      -H "Content-Type: application/json" \
-      -H "Idempotency-Key: smoke-resched-$((i+1))-$(date +%s%N)" \
-      "$API_BASE/v1/public/$TENANT_SLUG/bookings/$BOOKING2_ID/reschedule" \
-      -d "{\"token\":\"$RESCH2_TOKEN\",\"new_start_at\":\"$NEW_START\",\"new_end_at\":\"$NEW_END\"}" || true)"
-
-    cat /tmp/reschedule.res | jq . || cat /tmp/reschedule.res
-
-    if [[ "$CODE" == "200" || "$CODE" == "201" ]]; then
-      RESCHEDULE_OK=1
-      break
-    fi
-
-    if [[ "$CODE" == "409" ]]; then
-      echo "reschedule conflict -> try next slot" >&2
-      continue
-    fi
-
-    echo "reschedule failed http=$CODE" >&2
-    exit 1
-  done
-
-  [[ "$RESCHEDULE_OK" -eq 1 ]] || { echo "reschedule failed after retries (all conflicts)" >&2; exit 1; }
-
-echo "[DONE] smoke flow finished."
-echo "booking1(canceled)=$BOOKING_ID"
-echo "booking2(rescheduled)=$BOOKING2_ID"
+log "DONE booking1(canceled)=$BOOKING_ID booking2(rescheduled)=$BOOKING2_ID"
+log "request-id map: $REQUEST_FILE"
+log "artifacts: $ARTIFACT_DIR"

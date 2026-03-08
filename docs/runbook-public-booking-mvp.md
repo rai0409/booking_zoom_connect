@@ -1,18 +1,172 @@
-# Public Booking MVP Runbook
+# Sprint 2 Public Booking Operational Runbook
 
-## URLs
-- API health: http://localhost:4000/health
-- API ready:  http://localhost:4000/ready
-- UI:         http://localhost:3000/public/acme
+## 1. Purpose and Scope
+This runbook defines Sprint 2 operational acceptance for the public booking flow in a constrained local environment (single-tenant / single-mailbox assumptions).
 
-## MVP done criteria
-1) UI or curl で hold -> verify-email -> confirm が成功する
-2) DBで confirmed を直接確認できる
+In-scope:
+- public API flow verification (no UI dependency)
+- smoke execution artifacts
+- request-id traceability
+- DB state verification
 
-## DB check
+Out-of-scope:
+- UI acceptance/design
+- multi-mailbox optimization
+- large architecture refactors
+
+## 2. Acceptance Source of Truth
+- Source of truth is current code + tests + smoke scripts + DB evidence.
+- UI is **not** the source of truth for Sprint 2 acceptance.
+- `docs/booking_mvp_plan.md` is legacy context only.
+
+Primary acceptance flow order:
+1. `salespersons`
+2. `availability`
+3. `hold`
+4. `verify-email`
+5. `confirm`
+6. `cancel` / `reschedule`
+
+`confirm-by-id` is secondary/compatibility behavior, not primary acceptance flow.
+
+## 3. Preconditions
+- Repository: `booking_zoom_connect`
+- Local Postgres is running from repo root `docker-compose.yml`
+- API is running locally (`http://localhost:4000`)
+- `.env` is present at repo root with required local values
+
+Recommended preflight:
+```bash
+cd /home/rai/booking_zoom_connect
+docker compose up -d postgres
+curl -fsS http://localhost:4000/health
+curl -fsS http://localhost:4000/ready
+```
+
+## 4. Required Environment Variables
+Required for Sprint 2 acceptance:
+- `DATABASE_URL`
+- `BASE_URL`
+- `API_BASE_URL`
+- `NEXT_PUBLIC_API_BASE`
+- `JWT_SECRET`
+- `ADMIN_API_KEY`
+- `PUBLIC_RETURN_VERIFY_TOKEN=1` (for local smoke verification)
+
+Local default assumptions used by smoke:
+- `GRAPH_ENABLED=0`
+- `ZOOM_ENABLED=0`
+- `GRAPH_MOCK=true`
+- `ZOOM_MOCK=true`
+
+## 5. Seed Assumptions
+- Dev tenant slug is `acme`
+- Public booking is enabled on `acme`
+- Seeded salespersons exist and at least one is active
+- `apps/api/prisma/seed.ts` supports `ACTIVE_SEED_COUNT` switching (default `3`)
+
+Example seed execution:
 ```bash
 cd apps/api
-source .env
-psql "${DATABASE_URL%%\?schema=*}" -c \
-"select id, status, start_at_utc, end_at_utc from bookings order by created_at desc limit 5;"
+pnpm prisma migrate dev --schema prisma/schema.prisma
+pnpm prisma generate --schema prisma/schema.prisma
+pnpm db:seed
 ```
+
+## 6. Expected Status Matrix
+- `hold` creation: booking status `hold`
+- `verify-email`: booking transitions to `pending_verify` (or stays valid through idempotency)
+- `confirm` success: booking status `confirmed`, hold row removed
+- `cancel` success (before deadline): booking status `canceled`
+- `reschedule` success (confirmed only, before deadline): booking stays `confirmed` with updated slot
+- expired hold: booking status `expired`, hold row removed
+
+## 7. Sprint 2 Execution Procedure
+Main operational smoke:
+```bash
+bash scripts/smoke_public_flow_safe.sh
+```
+
+Minimal happy-path smoke:
+```bash
+bash scripts/smoke-public.sh
+```
+
+Both scripts are API-only and do not require UI interaction.
+
+## 8. x-request-id Tracing Procedure
+1. For each write request, capture response headers and extract `x-request-id`.
+2. Keep per-step artifacts (`.hdr`, `.json`, `.code`) from smoke output.
+3. Correlate with API logs by request id.
+
+Manual example:
+```bash
+curl -sS -D /tmp/hold.hdr -o /tmp/hold.json \
+  -X POST "http://localhost:4000/v1/public/acme/holds" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: demo-hold-1' \
+  --data-binary @/tmp/hold_payload.json
+
+rg -n '^x-request-id:' /tmp/hold.hdr
+```
+
+## 9. DB Verification Procedure
+Use:
+- `docs/sql/public-booking-sprint2-check.sql`
+
+Recommended invocation:
+```bash
+set -a; source .env; set +a
+psql "${DATABASE_URL%%\?schema=*}" -f docs/sql/public-booking-sprint2-check.sql
+```
+
+For booking-focused checks:
+```bash
+psql "${DATABASE_URL%%\?schema=*}" -v booking_id='<BOOKING_UUID>' -f docs/sql/public-booking-sprint2-check.sql
+psql "${DATABASE_URL%%\?schema=*}" -v customer_email='user@example.com' -f docs/sql/public-booking-sprint2-check.sql
+```
+
+## 10. Cancel / Reschedule Checks
+Cancel checks:
+- token purpose is `cancel`
+- booking currently `confirmed`
+- cancel deadline not passed
+- result status is `canceled`
+
+Reschedule checks:
+- token purpose is `reschedule`
+- booking currently `confirmed`
+- reschedule deadline not passed
+- new slot is accepted (409 conflicts may require retry)
+- result contains updated slot fields
+
+## 11. Hold Expiry Checks
+To verify expiry behavior:
+1. Create hold
+2. Force hold expiry in DB (local test env only)
+3. Run expiry worker path (`expireHolds`) or wait scheduled execution
+4. Confirm booking is `expired` and hold row is removed
+
+## 12. Failure-case Checklist
+When flow fails, collect in this order:
+1. `x-request-id` from response headers
+2. request/response artifact files for failed step
+3. relevant API log lines for the same request id
+4. DB evidence from SQL doc queries
+
+Typical failure classes to label:
+- validation failure (400)
+- token failure (401/403)
+- state/deadline conflict (409)
+- slot conflict (409)
+- idempotency replay behavior
+
+## 13. Artifacts / Evidence to Keep
+Keep one timestamped artifact directory per run containing:
+- per-step response headers (`*.hdr`)
+- per-step response bodies (`*.res` / `*.json`)
+- per-step status codes (`*.code`)
+- extracted request-id summary
+- final operator summary (booking ids + terminal states)
+
+Acceptance is based on these artifacts + DB/log traceability, not UI screenshots.

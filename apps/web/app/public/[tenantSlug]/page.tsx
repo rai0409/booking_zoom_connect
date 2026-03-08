@@ -7,12 +7,151 @@ type Slot = { start_at_utc: string; end_at_utc: string };
 type HoldResp = { id: string; status: string; start_at_utc: string; end_at_utc: string; hold: { expires_at_utc: string } };
 type VerifyResp = { status: string; token?: string };
 type ConfirmResp = { status: string; booking_id: string; cancel_url?: string; reschedule_url?: string };
+type CancelResp = { status: string };
+type RescheduleResp = {
+  status: string;
+  booking_id: string;
+  old_start_at_utc: string;
+  old_end_at_utc: string;
+  new_start_at_utc: string;
+  new_end_at_utc: string;
+};
+type TokenAction = "confirm" | "cancel" | "reschedule";
+type ActionType = "form" | TokenAction;
+type SuccessType = "confirm_success" | "cancel_success" | "reschedule_success" | "verification_sent";
+type RecoverableErrorType = "token_expired_or_used" | "hold_expired" | "slot_unavailable" | "retry_required";
+type FatalErrorType = "invalid_link" | "request_failed" | "unexpected_error";
+type ErrorType = RecoverableErrorType | FatalErrorType;
+type ResultType = null | "success" | "retryable_error" | "fatal_error";
+
+function extractErrorText(raw: string) {
+  if (!raw) return "";
+  try {
+    const parsed = JSON.parse(raw) as { message?: unknown; error?: unknown };
+    if (Array.isArray(parsed.message)) return parsed.message.join(", ");
+    if (typeof parsed.message === "string") return parsed.message;
+    if (typeof parsed.error === "string") return parsed.error;
+  } catch {
+    // plain text error is also valid
+  }
+  return raw;
+}
+
+function classifyActionError(status: number, raw: string, action: TokenAction): {
+  resultType: Exclude<ResultType, null>;
+  errorType: ErrorType;
+  message: string;
+} {
+  const message = extractErrorText(raw);
+  const normalized = `${status} ${message}`.toLowerCase();
+
+  if (
+    (normalized.includes("token") && normalized.includes("expired")) ||
+    normalized.includes("already used") ||
+    normalized.includes("既に使用")
+  ) {
+    return {
+      resultType: "retryable_error",
+      errorType: "token_expired_or_used",
+      message: "リンクの有効期限が切れているか、既に使用されています。"
+    };
+  }
+  if (normalized.includes("hold") && normalized.includes("expired")) {
+    return {
+      resultType: "retryable_error",
+      errorType: "hold_expired",
+      message: "予約保持の有効期限が切れています。もう一度時間枠を選択してください。"
+    };
+  }
+  if (
+    (normalized.includes("slot") && normalized.includes("taken")) ||
+    normalized.includes("slot unavailable") ||
+    normalized.includes("already taken")
+  ) {
+    return {
+      resultType: "retryable_error",
+      errorType: "slot_unavailable",
+      message: "選択した時間枠は利用できません。別の時間枠で再度お試しください。"
+    };
+  }
+  if (status === 409) {
+    return {
+      resultType: "retryable_error",
+      errorType: "retry_required",
+      message:
+        action === "reschedule"
+          ? "このリンクでは日程変更を完了できませんでした。再度リンクを開いてお試しください。"
+          : "このリンクでは処理を完了できませんでした。再度お試しください。"
+    };
+  }
+  if (
+    status === 400 ||
+    status === 401 ||
+    status === 403 ||
+    status === 404 ||
+    normalized.includes("invalid token") ||
+    normalized.includes("token required") ||
+    normalized.includes("token booking mismatch")
+  ) {
+    return {
+      resultType: "fatal_error",
+      errorType: "invalid_link",
+      message: "リンクが無効です。メールの最新リンクをご利用ください。"
+    };
+  }
+  if (status >= 500) {
+    return {
+      resultType: "fatal_error",
+      errorType: "request_failed",
+      message: "現在処理できません。時間をおいて再度お試しください。"
+    };
+  }
+  return {
+    resultType: "fatal_error",
+    errorType: "request_failed",
+    message: "リクエストに失敗しました。"
+  };
+}
+
+function formatActionErrorLabel(errorType: ErrorType | null) {
+  switch (errorType) {
+    case "token_expired_or_used":
+      return "token_expired_or_used";
+    case "hold_expired":
+      return "hold_expired";
+    case "slot_unavailable":
+      return "slot_unavailable";
+    case "retry_required":
+      return "retry_required";
+    case "invalid_link":
+      return "invalid_link";
+    case "request_failed":
+      return "request_failed";
+    case "unexpected_error":
+      return "unexpected_error";
+    default:
+      return "";
+  }
+}
 
 export default function PublicBookingPage({ params }: { params: { tenantSlug: string } }) {
   const tenantSlug = params.tenantSlug;
   const searchParams = useSearchParams();
   const token = searchParams.get("token") || "";
+  const actionParam = searchParams.get("action") || "";
+  const queryBookingId = (searchParams.get("booking_id") || "").trim();
+  const queryNewStartAt = searchParams.get("new_start_at") || "";
+  const queryNewEndAt = searchParams.get("new_end_at") || "";
   const storageKey = useMemo(() => `public-booking:${tenantSlug}:booking_id`, [tenantSlug]);
+  const tokenAction = useMemo<TokenAction | null>(() => {
+    if (!token) return null;
+    if (actionParam === "confirm" || actionParam === "cancel" || actionParam === "reschedule") {
+      return actionParam;
+    }
+    // Legacy fallback: old links with token but without action are treated as confirm.
+    return "confirm";
+  }, [actionParam, token]);
+  const actionType: ActionType = tokenAction ?? "form";
 
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [slots, setSlots] = useState<Slot[]>([]);
@@ -25,12 +164,14 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
 
   const [loadingSlots, setLoadingSlots] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [err, setErr] = useState("");
-  const [done, setDone] = useState<ConfirmResp | null>(null);
-  const [awaitingEmail, setAwaitingEmail] = useState(false);
+  const [resultType, setResultType] = useState<ResultType>(null);
+  const [successType, setSuccessType] = useState<SuccessType | null>(null);
+  const [errorType, setErrorType] = useState<ErrorType | null>(null);
+  const [errorMessage, setErrorMessage] = useState("");
+  const [processingAction, setProcessingAction] = useState<TokenAction | null>(null);
+  const [confirmResult, setConfirmResult] = useState<ConfirmResp | null>(null);
   const [storedBookingId, setStoredBookingId] = useState<string | null>(null);
-  const [confirmRetryable, setConfirmRetryable] = useState(false);
-  const [confirmedToken, setConfirmedToken] = useState<string | null>(null);
+  const [processedTokenKey, setProcessedTokenKey] = useState<string | null>(null);
 
   const selectedLabel = useMemo(() => {
     if (!selected) return "";
@@ -43,18 +184,24 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
   }, [storageKey]);
 
   useEffect(() => {
-    if (token) return;
+    if (actionType !== "form") return;
     let cancelled = false;
     (async () => {
       setLoadingSlots(true);
-      setErr("");
+      setResultType(null);
+      setErrorType(null);
+      setErrorMessage("");
       setSelected(null);
       const r = await fetch(`/api/public/${tenantSlug}/availability?date=${encodeURIComponent(date)}`, {
         cache: "no-store"
       });
       const txt = await r.text();
       if (!r.ok) {
-        if (!cancelled) setErr(`availability failed: ${r.status} ${txt}`);
+        if (!cancelled) {
+          setResultType("fatal_error");
+          setErrorType("request_failed");
+          setErrorMessage("空き枠の取得に失敗しました。時間をおいて再度お試しください。");
+        }
         if (!cancelled) setSlots([]);
         if (!cancelled) setLoadingSlots(false);
         return;
@@ -67,56 +214,164 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
     return () => {
       cancelled = true;
     };
-  }, [tenantSlug, date, token]);
+  }, [actionType, tenantSlug, date]);
 
   useEffect(() => {
-    if (!token || done || confirmedToken === token) return;
+    if (!tokenAction || !token) return;
+    const tokenKey = [
+      tenantSlug,
+      tokenAction,
+      token,
+      queryBookingId,
+      queryNewStartAt,
+      queryNewEndAt
+    ].join(":");
+    if (processedTokenKey === tokenKey) return;
 
     let cancelled = false;
     (async () => {
-      setConfirmedToken(token);
+      setProcessedTokenKey(tokenKey);
+      setProcessingAction(tokenAction);
       setSubmitting(true);
-      setErr("");
-      setAwaitingEmail(false);
-      setConfirmRetryable(false);
-      const confirmRes = await fetch(`/api/public/${tenantSlug}/confirm`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
-        body: JSON.stringify({ token })
-      });
-      const confirmTxt = await confirmRes.text();
-      if (cancelled) return;
-      if (!confirmRes.ok) {
-        if (confirmRes.status === 401 || confirmRes.status === 409) {
-          setErr("確認リンクの有効期限が切れているか、既に使用されています。確認メールを再送してください。");
-          setConfirmRetryable(true);
-        } else {
-          setErr(`予約確定に失敗しました: ${confirmRes.status} ${confirmTxt}`);
+      setResultType(null);
+      setSuccessType(null);
+      setErrorType(null);
+      setErrorMessage("");
+
+      if (tokenAction === "confirm") {
+        const confirmRes = await fetch(`/api/public/${tenantSlug}/confirm`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+          body: JSON.stringify({ token })
+        });
+        const confirmTxt = await confirmRes.text();
+        if (cancelled) return;
+        if (!confirmRes.ok) {
+          const classified = classifyActionError(confirmRes.status, confirmTxt, tokenAction);
+          setResultType(classified.resultType);
+          setErrorType(classified.errorType);
+          setErrorMessage(classified.message);
+          setProcessingAction(null);
+          setSubmitting(false);
+          return;
         }
+
+        setConfirmResult(JSON.parse(confirmTxt) as ConfirmResp);
+        setResultType("success");
+        setSuccessType("confirm_success");
+        window.localStorage.removeItem(storageKey);
+        setStoredBookingId(null);
+        setProcessingAction(null);
         setSubmitting(false);
         return;
       }
 
-      setDone(JSON.parse(confirmTxt) as ConfirmResp);
-      window.localStorage.removeItem(storageKey);
-      setStoredBookingId(null);
+      if (!queryBookingId) {
+        setResultType("fatal_error");
+        setErrorType("invalid_link");
+        setErrorMessage("リンク情報が不足しているため処理できません。");
+        setProcessingAction(null);
+        setSubmitting(false);
+        return;
+      }
+
+      if (tokenAction === "cancel") {
+        const cancelRes = await fetch(`/api/public/${tenantSlug}/bookings/${queryBookingId}/cancel`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+          body: JSON.stringify({ token })
+        });
+        const cancelTxt = await cancelRes.text();
+        if (cancelled) return;
+        if (!cancelRes.ok) {
+          const classified = classifyActionError(cancelRes.status, cancelTxt, tokenAction);
+          setResultType(classified.resultType);
+          setErrorType(classified.errorType);
+          setErrorMessage(classified.message);
+          setProcessingAction(null);
+          setSubmitting(false);
+          return;
+        }
+
+        JSON.parse(cancelTxt) as CancelResp;
+        setResultType("success");
+        setSuccessType("cancel_success");
+        if (storedBookingId === queryBookingId) {
+          window.localStorage.removeItem(storageKey);
+          setStoredBookingId(null);
+        }
+        setProcessingAction(null);
+        setSubmitting(false);
+        return;
+      }
+
+      if (!queryNewStartAt || !queryNewEndAt) {
+        // TODO(sprint3): provide slot-selection UI for reschedule links that only carry action+token.
+        setResultType("retryable_error");
+        setErrorType("retry_required");
+        setErrorMessage("このリンクでは日程変更に必要な情報が不足しています。案内に従って再度お試しください。");
+        setProcessingAction(null);
+        setSubmitting(false);
+        return;
+      }
+
+      const rescheduleRes = await fetch(`/api/public/${tenantSlug}/bookings/${queryBookingId}/reschedule`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+        body: JSON.stringify({
+          token,
+          new_start_at: queryNewStartAt,
+          new_end_at: queryNewEndAt
+        })
+      });
+      const rescheduleTxt = await rescheduleRes.text();
+      if (cancelled) return;
+      if (!rescheduleRes.ok) {
+        const classified = classifyActionError(rescheduleRes.status, rescheduleTxt, tokenAction);
+        setResultType(classified.resultType);
+        setErrorType(classified.errorType);
+        setErrorMessage(classified.message);
+        setProcessingAction(null);
+        setSubmitting(false);
+        return;
+      }
+
+      JSON.parse(rescheduleTxt) as RescheduleResp;
+      setResultType("success");
+      setSuccessType("reschedule_success");
+      setProcessingAction(null);
       setSubmitting(false);
     })().catch((e) => {
       if (cancelled) return;
-      setErr(`予約確定に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+      setResultType("fatal_error");
+      setErrorType("unexpected_error");
+      setErrorMessage(`予期しないエラーが発生しました: ${e instanceof Error ? e.message : String(e)}`);
+      setProcessingAction(null);
       setSubmitting(false);
     });
 
     return () => {
       cancelled = true;
     };
-  }, [confirmedToken, done, storageKey, tenantSlug, token]);
+  }, [
+    processedTokenKey,
+    queryBookingId,
+    queryNewEndAt,
+    queryNewStartAt,
+    storageKey,
+    storedBookingId,
+    tenantSlug,
+    token,
+    tokenAction
+  ]);
 
   async function resendVerificationEmail() {
-    if (!storedBookingId) return;
+    if (!storedBookingId || actionType !== "confirm") return;
 
     setSubmitting(true);
-    setErr("");
+    setResultType(null);
+    setErrorType(null);
+    setErrorMessage("");
     const verifyRes = await fetch(`/api/public/${tenantSlug}/verify-email`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
@@ -124,34 +379,46 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
     });
     const verifyTxt = await verifyRes.text();
     if (!verifyRes.ok) {
-      setErr(`確認メールの再送に失敗しました: ${verifyRes.status} ${verifyTxt}`);
+      const classified = classifyActionError(verifyRes.status, verifyTxt, "confirm");
+      setResultType(classified.resultType);
+      setErrorType(classified.errorType);
+      setErrorMessage(classified.message);
       setSubmitting(false);
       return;
     }
 
-    setAwaitingEmail(true);
-    setConfirmRetryable(false);
+    JSON.parse(verifyTxt) as VerifyResp;
+    setResultType("success");
+    setSuccessType("verification_sent");
     setSubmitting(false);
   }
 
   async function submitBooking() {
+    if (actionType !== "form") return;
     if (!selected) {
-      setErr("時間枠を選択してください");
+      setResultType("retryable_error");
+      setErrorType("retry_required");
+      setErrorMessage("時間枠を選択してください。");
       return;
     }
     if (!name.trim()) {
-      setErr("お名前を入力してください");
+      setResultType("retryable_error");
+      setErrorType("retry_required");
+      setErrorMessage("お名前を入力してください。");
       return;
     }
     if (!email.trim()) {
-      setErr("メールアドレスを入力してください");
+      setResultType("retryable_error");
+      setErrorType("retry_required");
+      setErrorMessage("メールアドレスを入力してください。");
       return;
     }
 
-    setErr("");
+    setResultType(null);
+    setSuccessType(null);
+    setErrorType(null);
+    setErrorMessage("");
     setSubmitting(true);
-    setAwaitingEmail(false);
-    setConfirmRetryable(false);
 
     try {
       const holdKey = crypto.randomUUID();
@@ -172,7 +439,10 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
       });
       const holdTxt = await holdRes.text();
       if (!holdRes.ok) {
-        setErr(`予約枠の確保に失敗しました: ${holdRes.status} ${holdTxt}`);
+        const classified = classifyActionError(holdRes.status, holdTxt, "confirm");
+        setResultType(classified.resultType);
+        setErrorType(classified.errorType);
+        setErrorMessage(classified.message);
         setSubmitting(false);
         return;
       }
@@ -187,60 +457,99 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
       });
       const verifyTxt = await verifyRes.text();
       if (!verifyRes.ok) {
-        setErr(`確認メール処理に失敗しました: ${verifyRes.status} ${verifyTxt}`);
+        const classified = classifyActionError(verifyRes.status, verifyTxt, "confirm");
+        setResultType(classified.resultType);
+        setErrorType(classified.errorType);
+        setErrorMessage(classified.message);
         setSubmitting(false);
         return;
       }
 
       JSON.parse(verifyTxt) as VerifyResp;
-      setAwaitingEmail(true);
+      setResultType("success");
+      setSuccessType("verification_sent");
       setSubmitting(false);
     } catch (e) {
-      setErr(`予約に失敗しました。別の時間を選んでください。 (${e instanceof Error ? e.message : String(e)})`);
+      setResultType("fatal_error");
+      setErrorType("unexpected_error");
+      setErrorMessage(`予約に失敗しました。 (${e instanceof Error ? e.message : String(e)})`);
       setSubmitting(false);
     }
   }
 
-  if (done) {
-    return (
-      <div className="mx-auto max-w-2xl p-6 space-y-6">
-        <h1 className="text-2xl font-semibold">予約完了</h1>
-        <p className="rounded border p-3 text-sm">
-          予約を受け付けました。確認メールを送信しました。届かない場合は迷惑メールフォルダをご確認ください。
-        </p>
-        {done.cancel_url ? (
-          <p className="text-sm">
-            キャンセル:{" "}
-            <a className="underline" href={done.cancel_url}>
-              {done.cancel_url}
-            </a>
-          </p>
-        ) : null}
-        {done.reschedule_url ? (
-          <p className="text-sm">
-            変更:{" "}
-            <a className="underline" href={done.reschedule_url}>
-              {done.reschedule_url}
-            </a>
-          </p>
-        ) : null}
-      </div>
-    );
-  }
+  if (actionType !== "form") {
+    const canResendVerification =
+      actionType === "confirm" && storedBookingId !== null && resultType === "retryable_error";
+    const processingText =
+      actionType === "confirm"
+        ? "予約を確認しています..."
+        : actionType === "cancel"
+          ? "予約をキャンセルしています..."
+          : "日程変更を処理しています...";
+    const actionTitle =
+      actionType === "confirm" ? "予約確認" : actionType === "cancel" ? "予約キャンセル" : "日程変更";
 
-  if (token) {
+    if (resultType === "success" && successType === "confirm_success") {
+      return (
+        <div className="mx-auto max-w-2xl p-6 space-y-6">
+          <h1 className="text-2xl font-semibold">予約完了</h1>
+          <p className="rounded border p-3 text-sm">
+            予約を受け付けました。確認メールを送信しました。届かない場合は迷惑メールフォルダをご確認ください。
+          </p>
+          {confirmResult?.cancel_url ? (
+            <p className="text-sm">
+              キャンセル:{" "}
+              <a className="underline" href={confirmResult.cancel_url}>
+                {confirmResult.cancel_url}
+              </a>
+            </p>
+          ) : null}
+          {confirmResult?.reschedule_url ? (
+            <p className="text-sm">
+              変更:{" "}
+              <a className="underline" href={confirmResult.reschedule_url}>
+                {confirmResult.reschedule_url}
+              </a>
+            </p>
+          ) : null}
+        </div>
+      );
+    }
+
+    if (resultType === "success" && successType === "cancel_success") {
+      return (
+        <div className="mx-auto max-w-2xl p-6 space-y-6">
+          <h1 className="text-2xl font-semibold">キャンセル完了</h1>
+          <p className="rounded border p-3 text-sm">予約のキャンセルが完了しました。</p>
+        </div>
+      );
+    }
+
+    if (resultType === "success" && successType === "reschedule_success") {
+      return (
+        <div className="mx-auto max-w-2xl p-6 space-y-6">
+          <h1 className="text-2xl font-semibold">日程変更完了</h1>
+          <p className="rounded border p-3 text-sm">予約の日程変更が完了しました。</p>
+        </div>
+      );
+    }
+
     return (
       <div className="mx-auto max-w-2xl p-6 space-y-6">
-        <h1 className="text-2xl font-semibold">予約確認</h1>
+        <h1 className="text-2xl font-semibold">{actionTitle}</h1>
         <p className="rounded border p-3 text-sm">
-          {submitting
-            ? "予約を確認しています..."
-            : awaitingEmail
+          {submitting && processingAction === actionType
+            ? processingText
+            : successType === "verification_sent"
               ? "確認メールを再送しました。新しいメール内のリンクをご利用ください。"
-              : "メール内の確認リンクを処理しています。"}
+              : "メール内のリンクを処理しています。"}
         </p>
-        {err ? <pre className="rounded border p-3 text-sm text-red-700 whitespace-pre-wrap">{err}</pre> : null}
-        {confirmRetryable && storedBookingId ? (
+        {resultType && resultType !== "success" && errorType ? (
+          <pre className="rounded border p-3 text-sm text-red-700 whitespace-pre-wrap">
+            [{formatActionErrorLabel(errorType)}] {errorMessage}
+          </pre>
+        ) : null}
+        {canResendVerification ? (
           <button
             className="rounded bg-black text-white px-4 py-2 disabled:opacity-50"
             disabled={submitting}
@@ -258,8 +567,12 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
     <div className="mx-auto max-w-2xl p-6 space-y-6">
       <h1 className="text-2xl font-semibold">予約フォーム ({tenantSlug})</h1>
 
-      {err && <pre className="rounded border p-3 text-sm text-red-700 whitespace-pre-wrap">{err}</pre>}
-      {awaitingEmail ? (
+      {resultType && resultType !== "success" ? (
+        <pre className="rounded border p-3 text-sm text-red-700 whitespace-pre-wrap">
+          [{formatActionErrorLabel(errorType)}] {errorMessage}
+        </pre>
+      ) : null}
+      {resultType === "success" && successType === "verification_sent" ? (
         <p className="rounded border p-3 text-sm">
           確認メールを送信しました。メール内のリンクから予約を確定してください。
         </p>
