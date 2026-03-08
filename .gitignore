@@ -65,3 +65,9 @@ _local_artifacts/
 
 # generated
 outputs/
+
+# local generated artifacts
+artifacts/
+
+# local sql notes
+docs/sql/
