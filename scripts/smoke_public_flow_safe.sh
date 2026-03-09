@@ -30,11 +30,6 @@ fi
 
 export PUBLIC_RETURN_VERIFY_TOKEN=1
 
-if [[ -z "${ADMIN_API_KEY:-}" ]]; then
-  echo "ADMIN_API_KEY missing in .env" >&2
-  exit 1
-fi
-
 log() {
   printf '[smoke-safe] %s\n' "$*" >&2
   printf '%s\n' "$*" >> "$SUMMARY_FILE"
@@ -152,6 +147,52 @@ pick_future_slot() {
   return 1
 }
 
+# Collect availability candidates across multiple days.
+# Arguments:
+#   1: output json file
+#   2: step prefix
+#   3: salesperson id
+#   4: base date (YYYY-MM-DD)
+#   5: max day offset (e.g. 7)
+#   6: exclude start_at_utc (optional)
+#   7: exclude end_at_utc   (optional)
+collect_slot_candidates() {
+  local out_file="$1"
+  local step_prefix="$2"
+  local salesperson_id="$3"
+  local base_date="$4"
+  local max_offset="$5"
+  local exclude_start="${6:-}"
+  local exclude_end="${7:-}"
+
+  printf '[]\n' > "$out_file"
+
+  local offset target_date step_name code day_file tmp_file
+  for ((offset=0; offset<=max_offset; offset++)); do
+    target_date="$(date -u -d "$base_date +$offset day" +%F)"
+    step_name="${step_prefix}_d${offset}"
+    code="$(http_call "$step_name" "$API_BASE/v1/public/$TENANT_SLUG/availability?salesperson=$salesperson_id&date=$target_date")"
+    expect_2xx "$code" "$step_name"
+
+    day_file="$ARTIFACT_DIR/${step_name}.candidates.json"
+    if [[ -n "$exclude_start" && -n "$exclude_end" ]]; then
+      jq -c --arg os "$exclude_start" --arg oe "$exclude_end" '
+        map(select(.start_at_utc != $os or .end_at_utc != $oe))
+      ' "$ARTIFACT_DIR/$step_name.res" > "$day_file"
+    elif [[ -n "$exclude_start" ]]; then
+      jq -c --arg os "$exclude_start" '
+        map(select(.start_at_utc != $os))
+      ' "$ARTIFACT_DIR/$step_name.res" > "$day_file"
+    else
+      cp "$ARTIFACT_DIR/$step_name.res" "$day_file"
+    fi
+
+    tmp_file="$ARTIFACT_DIR/${step_name}.merge.tmp.json"
+    jq -c -s '.[0] + .[1]' "$out_file" "$day_file" > "$tmp_file"
+    mv "$tmp_file" "$out_file"
+  done
+}
+
 log "artifact_dir=$ARTIFACT_DIR"
 
 # Preflight
@@ -220,37 +261,34 @@ expect_2xx "$(http_call confirm -X POST \
   -d "{\"token\":\"$VERIFY_TOKEN\"}")" "confirm"
 
 [[ "$(json_get "$ARTIFACT_DIR/confirm.res" '.status // empty')" == "confirmed" ]] || fail "confirm did not return status=confirmed"
-
-expect_2xx "$(http_call links -H "x-admin-api-key: $ADMIN_API_KEY" \
-  "$API_BASE/v1/internal/$TENANT_SLUG/bookings/$BOOKING_ID/links")" "links"
-
-CANCEL_URL="$(json_get "$ARTIFACT_DIR/links.res" '.cancel_url // empty')"
-RESCH_URL="$(json_get "$ARTIFACT_DIR/links.res" '.reschedule_url // empty')"
+CANCEL_URL="$(json_get "$ARTIFACT_DIR/confirm.res" '.cancel_url // empty')"
+RESCH_URL="$(json_get "$ARTIFACT_DIR/confirm.res" '.reschedule_url // empty')"
+CANCEL_BOOKING_ID="$(printf '%s' "$CANCEL_URL" | sed -n 's/.*[?&]booking_id=\([^&]*\).*/\1/p')"
+RESCH_BOOKING_ID="$(printf '%s' "$RESCH_URL" | sed -n 's/.*[?&]booking_id=\([^&]*\).*/\1/p')"
 CANCEL_TOKEN="$(printf '%s' "$CANCEL_URL" | sed -n 's/.*[?&]token=\([^&]*\).*/\1/p')"
 RESCH_TOKEN="$(printf '%s' "$RESCH_URL" | sed -n 's/.*[?&]token=\([^&]*\).*/\1/p')"
+[[ "$CANCEL_BOOKING_ID" == "$BOOKING_ID" ]] || fail "cancel_url booking_id mismatch"
+[[ "$RESCH_BOOKING_ID" == "$BOOKING_ID" ]] || fail "reschedule_url booking_id mismatch"
 [[ ${#CANCEL_TOKEN} -gt 50 ]] || fail "cancel token parse failed"
 [[ ${#RESCH_TOKEN} -gt 50 ]] || fail "reschedule token parse failed"
 
 expect_2xx "$(http_call cancel -X POST \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: smoke-cancel-$(date +%s%N)" \
-  "$API_BASE/v1/public/$TENANT_SLUG/bookings/$BOOKING_ID/cancel" \
+  "$API_BASE/v1/public/$TENANT_SLUG/bookings/$CANCEL_BOOKING_ID/cancel" \
   -d "{\"token\":\"$CANCEL_TOKEN\"}")" "cancel"
 
 # booking2: hold -> verify -> confirm -> reschedule (with 409 retry)
 DATE1="$(date -u -d "$START" +%F)"
-DATE2="$(date -u -d "$DATE1 +1 day" +%F)"
 
-expect_2xx "$(http_call availability_resched_same_day "$API_BASE/v1/public/$TENANT_SLUG/availability?salesperson=$SP_ID&date=$DATE1")" "availability_resched_same_day"
-expect_2xx "$(http_call availability_resched_next_day "$API_BASE/v1/public/$TENANT_SLUG/availability?salesperson=$SP_ID&date=$DATE2")" "availability_resched_next_day"
-
-jq -c --arg start "$START" '
-  map(select(.start_at_utc != $start))
-' "$ARTIFACT_DIR/availability_resched_same_day.res" > "$ARTIFACT_DIR/resched_candidates_same_day.json"
-
-jq -c -s '.[0] + .[1]' \
-  "$ARTIFACT_DIR/resched_candidates_same_day.json" \
-  "$ARTIFACT_DIR/availability_resched_next_day.res" > "$ARTIFACT_DIR/resched_candidates_all.json"
+collect_slot_candidates \
+  "$ARTIFACT_DIR/resched_candidates_all.json" \
+  "availability_resched" \
+  "$SP_ID" \
+  "$DATE1" \
+  7 \
+  "$START" \
+  "$END"
 
 BOOKING2_ID=""
 OLD2_START=""
@@ -313,25 +351,21 @@ expect_2xx "$(http_call confirm2 -X POST \
   -d "{\"token\":\"$VERIFY2_TOKEN\"}")" "confirm2"
 
 [[ "$(json_get "$ARTIFACT_DIR/confirm2.res" '.status // empty')" == "confirmed" ]] || fail "confirm2 did not return confirmed"
-
-expect_2xx "$(http_call links2 -H "x-admin-api-key: $ADMIN_API_KEY" \
-  "$API_BASE/v1/internal/$TENANT_SLUG/bookings/$BOOKING2_ID/links")" "links2"
-
-RESCH2_URL="$(json_get "$ARTIFACT_DIR/links2.res" '.reschedule_url // empty')"
+RESCH2_URL="$(json_get "$ARTIFACT_DIR/confirm2.res" '.reschedule_url // empty')"
+RESCH2_BOOKING_ID="$(printf '%s' "$RESCH2_URL" | sed -n 's/.*[?&]booking_id=\([^&]*\).*/\1/p')"
 RESCH2_TOKEN="$(printf '%s' "$RESCH2_URL" | sed -n 's/.*[?&]token=\([^&]*\).*/\1/p')"
+[[ "$RESCH2_BOOKING_ID" == "$BOOKING2_ID" ]] || fail "reschedule2_url booking_id mismatch"
 [[ ${#RESCH2_TOKEN} -gt 50 ]] || fail "reschedule2 token parse failed"
 
-expect_2xx "$(http_call availability_reschedule_target "$API_BASE/v1/public/$TENANT_SLUG/availability?salesperson=$SP_ID&date=$(date -u -d "$OLD2_START" +%F)")" "availability_reschedule_target"
-
-jq -c --arg os "$OLD2_START" --arg oe "$OLD2_END" '
-  map(select(.start_at_utc != $os or .end_at_utc != $oe))
-' "$ARTIFACT_DIR/availability_reschedule_target.res" > "$ARTIFACT_DIR/reschedule_targets.json"
-
-if [[ "$(jq 'length' "$ARTIFACT_DIR/reschedule_targets.json")" -eq 0 ]]; then
-  NEXT_DATE="$(date -u -d "$(date -u -d "$OLD2_START" +%F) +1 day" +%F)"
-  expect_2xx "$(http_call availability_reschedule_target_next "$API_BASE/v1/public/$TENANT_SLUG/availability?salesperson=$SP_ID&date=$NEXT_DATE")" "availability_reschedule_target_next"
-  cp "$ARTIFACT_DIR/availability_reschedule_target_next.res" "$ARTIFACT_DIR/reschedule_targets.json"
-fi
+BASE_RESCH_DATE="$(date -u -d "$OLD2_START" +%F)"
+collect_slot_candidates \
+  "$ARTIFACT_DIR/reschedule_targets.json" \
+  "availability_reschedule_target" \
+  "$SP_ID" \
+  "$BASE_RESCH_DATE" \
+  7 \
+  "$OLD2_START" \
+  "$OLD2_END"
 
 [[ "$(jq 'length' "$ARTIFACT_DIR/reschedule_targets.json")" -gt 0 ]] || fail "no candidate slot for reschedule"
 
@@ -350,7 +384,7 @@ for i in 0 1 2 3 4; do
   CODER="$(http_call "reschedule_try_$((i+1))" -X POST \
     -H "Content-Type: application/json" \
     -H "Idempotency-Key: smoke-reschedule-$((i+1))-$(date +%s%N)" \
-    "$API_BASE/v1/public/$TENANT_SLUG/bookings/$BOOKING2_ID/reschedule" \
+    "$API_BASE/v1/public/$TENANT_SLUG/bookings/$RESCH2_BOOKING_ID/reschedule" \
     -d "{\"token\":\"$RESCH2_TOKEN\",\"new_start_at\":\"$NEW_START\",\"new_end_at\":\"$NEW_END\"}")"
 
   if [[ "$CODER" =~ ^2 ]]; then

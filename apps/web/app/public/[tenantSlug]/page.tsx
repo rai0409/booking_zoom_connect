@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 
 type Slot = { start_at_utc: string; end_at_utc: string };
+type Salesperson = { id: string; display_name: string; timezone?: string };
 type HoldResp = { id: string; status: string; start_at_utc: string; end_at_utc: string; hold: { expires_at_utc: string } };
 type VerifyResp = { status: string; token?: string };
 type ConfirmResp = { status: string; booking_id: string; cancel_url?: string; reschedule_url?: string };
@@ -140,8 +141,6 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
   const token = searchParams.get("token") || "";
   const actionParam = searchParams.get("action") || "";
   const queryBookingId = (searchParams.get("booking_id") || "").trim();
-  const queryNewStartAt = searchParams.get("new_start_at") || "";
-  const queryNewEndAt = searchParams.get("new_end_at") || "";
   const storageKey = useMemo(() => `public-booking:${tenantSlug}:booking_id`, [tenantSlug]);
   const tokenAction = useMemo<TokenAction | null>(() => {
     if (!token) return null;
@@ -172,11 +171,20 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
   const [confirmResult, setConfirmResult] = useState<ConfirmResp | null>(null);
   const [storedBookingId, setStoredBookingId] = useState<string | null>(null);
   const [processedTokenKey, setProcessedTokenKey] = useState<string | null>(null);
+  const [rescheduleDate, setRescheduleDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [rescheduleSalespersonId, setRescheduleSalespersonId] = useState("");
+  const [rescheduleSlots, setRescheduleSlots] = useState<Slot[]>([]);
+  const [rescheduleSelected, setRescheduleSelected] = useState<Slot | null>(null);
+  const [loadingRescheduleSlots, setLoadingRescheduleSlots] = useState(false);
 
   const selectedLabel = useMemo(() => {
     if (!selected) return "";
     return `${selected.start_at_utc} - ${selected.end_at_utc}`;
   }, [selected]);
+  const selectedRescheduleLabel = useMemo(() => {
+    if (!rescheduleSelected) return "";
+    return `${rescheduleSelected.start_at_utc} - ${rescheduleSelected.end_at_utc}`;
+  }, [rescheduleSelected]);
 
   useEffect(() => {
     const saved = window.localStorage.getItem(storageKey);
@@ -218,27 +226,20 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
 
   useEffect(() => {
     if (!tokenAction || !token) return;
-    const tokenKey = [
-      tenantSlug,
-      tokenAction,
-      token,
-      queryBookingId,
-      queryNewStartAt,
-      queryNewEndAt
-    ].join(":");
+    const tokenKey = [tenantSlug, tokenAction, token, queryBookingId].join(":");
     if (processedTokenKey === tokenKey) return;
 
     let cancelled = false;
     (async () => {
       setProcessedTokenKey(tokenKey);
-      setProcessingAction(tokenAction);
-      setSubmitting(true);
       setResultType(null);
       setSuccessType(null);
       setErrorType(null);
       setErrorMessage("");
 
       if (tokenAction === "confirm") {
+        setProcessingAction(tokenAction);
+        setSubmitting(true);
         const confirmRes = await fetch(`/api/public/${tenantSlug}/confirm`, {
           method: "POST",
           headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
@@ -276,6 +277,8 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
       }
 
       if (tokenAction === "cancel") {
+        setProcessingAction(tokenAction);
+        setSubmitting(true);
         const cancelRes = await fetch(`/api/public/${tenantSlug}/bookings/${queryBookingId}/cancel`, {
           method: "POST",
           headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
@@ -305,40 +308,8 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
         return;
       }
 
-      if (!queryNewStartAt || !queryNewEndAt) {
-        // TODO(sprint3): provide slot-selection UI for reschedule links that only carry action+token.
-        setResultType("retryable_error");
-        setErrorType("retry_required");
-        setErrorMessage("このリンクでは日程変更に必要な情報が不足しています。案内に従って再度お試しください。");
-        setProcessingAction(null);
-        setSubmitting(false);
-        return;
-      }
-
-      const rescheduleRes = await fetch(`/api/public/${tenantSlug}/bookings/${queryBookingId}/reschedule`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
-        body: JSON.stringify({
-          token,
-          new_start_at: queryNewStartAt,
-          new_end_at: queryNewEndAt
-        })
-      });
-      const rescheduleTxt = await rescheduleRes.text();
-      if (cancelled) return;
-      if (!rescheduleRes.ok) {
-        const classified = classifyActionError(rescheduleRes.status, rescheduleTxt, tokenAction);
-        setResultType(classified.resultType);
-        setErrorType(classified.errorType);
-        setErrorMessage(classified.message);
-        setProcessingAction(null);
-        setSubmitting(false);
-        return;
-      }
-
-      JSON.parse(rescheduleTxt) as RescheduleResp;
-      setResultType("success");
-      setSuccessType("reschedule_success");
+      // For reschedule, URL is for target identification only (booking_id + token).
+      // Slot selection is handled in UI and submitted in request body.
       setProcessingAction(null);
       setSubmitting(false);
     })().catch((e) => {
@@ -356,14 +327,148 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
   }, [
     processedTokenKey,
     queryBookingId,
-    queryNewEndAt,
-    queryNewStartAt,
     storageKey,
     storedBookingId,
     tenantSlug,
     token,
     tokenAction
   ]);
+
+  useEffect(() => {
+    if (actionType !== "reschedule" || !token) return;
+    if (!queryBookingId) return;
+    if (rescheduleSalespersonId) return;
+
+    let cancelled = false;
+    (async () => {
+      const salesRes = await fetch(`/api/public/${tenantSlug}/salespersons`, { cache: "no-store" });
+      const salesTxt = await salesRes.text();
+      if (cancelled) return;
+      if (!salesRes.ok) {
+        const classified = classifyActionError(salesRes.status, salesTxt, "reschedule");
+        setResultType(classified.resultType);
+        setErrorType(classified.errorType);
+        setErrorMessage(classified.message);
+        return;
+      }
+
+      const salespersons = JSON.parse(salesTxt) as Salesperson[];
+      const selectedSalesperson = salespersons[0]?.id || "";
+      if (!selectedSalesperson) {
+        setResultType("retryable_error");
+        setErrorType("retry_required");
+        setErrorMessage("日程変更対象の担当者が見つかりません。");
+        return;
+      }
+      setRescheduleSalespersonId(selectedSalesperson);
+    })().catch((e) => {
+      if (cancelled) return;
+      setResultType("fatal_error");
+      setErrorType("unexpected_error");
+      setErrorMessage(`日程変更の初期化に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [actionType, queryBookingId, rescheduleSalespersonId, tenantSlug, token]);
+
+  useEffect(() => {
+    if (actionType !== "reschedule" || !token || !queryBookingId || !rescheduleSalespersonId) return;
+    if (resultType === "success" && successType === "reschedule_success") return;
+
+    let cancelled = false;
+    (async () => {
+      setLoadingRescheduleSlots(true);
+      setRescheduleSelected(null);
+      const res = await fetch(
+        `/api/public/${tenantSlug}/availability?date=${encodeURIComponent(rescheduleDate)}&salesperson=${encodeURIComponent(rescheduleSalespersonId)}`,
+        { cache: "no-store" }
+      );
+      const txt = await res.text();
+      if (cancelled) return;
+      if (!res.ok) {
+        const classified = classifyActionError(res.status, txt, "reschedule");
+        setResultType(classified.resultType);
+        setErrorType(classified.errorType);
+        setErrorMessage(classified.message);
+        setRescheduleSlots([]);
+        setLoadingRescheduleSlots(false);
+        return;
+      }
+
+      setRescheduleSlots(JSON.parse(txt) as Slot[]);
+      setLoadingRescheduleSlots(false);
+    })().catch((e) => {
+      if (cancelled) return;
+      setResultType("fatal_error");
+      setErrorType("unexpected_error");
+      setErrorMessage(`日程変更候補の取得に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+      setRescheduleSlots([]);
+      setLoadingRescheduleSlots(false);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [actionType, queryBookingId, rescheduleDate, rescheduleSalespersonId, successType, tenantSlug, token]);
+
+  async function submitReschedule() {
+    if (actionType !== "reschedule") return;
+    if (!token || !queryBookingId) {
+      setResultType("fatal_error");
+      setErrorType("invalid_link");
+      setErrorMessage("リンク情報が不足しているため処理できません。");
+      return;
+    }
+    if (!rescheduleSelected) {
+      setResultType("retryable_error");
+      setErrorType("retry_required");
+      setErrorMessage("変更先の時間枠を選択してください。");
+      return;
+    }
+
+    setSubmitting(true);
+    setProcessingAction("reschedule");
+    setResultType(null);
+    setSuccessType(null);
+    setErrorType(null);
+    setErrorMessage("");
+
+    try {
+      const rescheduleRes = await fetch(`/api/public/${tenantSlug}/bookings/${queryBookingId}/reschedule`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+        body: JSON.stringify({
+          token,
+          new_start_at: rescheduleSelected.start_at_utc,
+          new_end_at: rescheduleSelected.end_at_utc
+        })
+      });
+      const rescheduleTxt = await rescheduleRes.text();
+      if (!rescheduleRes.ok) {
+        const classified = classifyActionError(rescheduleRes.status, rescheduleTxt, "reschedule");
+        setResultType(classified.resultType);
+        setErrorType(classified.errorType);
+        setErrorMessage(classified.message);
+        setProcessingAction(null);
+        setSubmitting(false);
+        return;
+      }
+
+      JSON.parse(rescheduleTxt) as RescheduleResp;
+      setResultType("success");
+      setSuccessType("reschedule_success");
+      setProcessingAction(null);
+      setSubmitting(false);
+    } catch (e) {
+      setResultType("fatal_error");
+      setErrorType("unexpected_error");
+      setErrorMessage(`日程変更に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+      setProcessingAction(null);
+      setSubmitting(false);
+    }
+  }
 
   async function resendVerificationEmail() {
     if (!storedBookingId || actionType !== "confirm") return;
@@ -480,6 +585,7 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
   if (actionType !== "form") {
     const canResendVerification =
       actionType === "confirm" && storedBookingId !== null && resultType === "retryable_error";
+    const canRenderRescheduleForm = actionType === "reschedule" && !!queryBookingId;
     const processingText =
       actionType === "confirm"
         ? "予約を確認しています..."
@@ -542,12 +648,60 @@ export default function PublicBookingPage({ params }: { params: { tenantSlug: st
             ? processingText
             : successType === "verification_sent"
               ? "確認メールを再送しました。新しいメール内のリンクをご利用ください。"
-              : "メール内のリンクを処理しています。"}
+              : actionType === "reschedule"
+                ? "変更先の時間枠を選択してください。"
+                : "メール内のリンクを処理しています。"}
         </p>
         {resultType && resultType !== "success" && errorType ? (
           <pre className="rounded border p-3 text-sm text-red-700 whitespace-pre-wrap">
             [{formatActionErrorLabel(errorType)}] {errorMessage}
           </pre>
+        ) : null}
+        {canRenderRescheduleForm ? (
+          <section className="space-y-3">
+            <label className="block">
+              <div className="text-sm">変更日</div>
+              <input
+                className="w-full border rounded p-2"
+                type="date"
+                value={rescheduleDate}
+                onChange={(e) => setRescheduleDate(e.target.value)}
+              />
+            </label>
+            <div className="text-sm font-medium">変更可能な時間枠</div>
+            {loadingRescheduleSlots ? <div className="text-sm">読み込み中...</div> : null}
+            {loadingRescheduleSlots ? null : (
+              <div className="grid grid-cols-1 gap-2">
+                {rescheduleSlots.map((s) => {
+                  const active =
+                    rescheduleSelected?.start_at_utc === s.start_at_utc && rescheduleSelected?.end_at_utc === s.end_at_utc;
+                  return (
+                    <button
+                      key={`${s.start_at_utc}-${s.end_at_utc}`}
+                      className={`border rounded p-3 text-left ${active ? "border-black" : "border-gray-300"}`}
+                      onClick={() => setRescheduleSelected(s)}
+                      type="button"
+                    >
+                      <div className="text-sm">{s.start_at_utc}</div>
+                      <div className="text-sm">{s.end_at_utc}</div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            {!loadingRescheduleSlots && rescheduleSlots.length === 0 ? (
+              <p className="text-sm">変更可能な時間枠が見つかりませんでした。日付を変更して再度お試しください。</p>
+            ) : null}
+            {selectedRescheduleLabel ? <div className="text-sm">選択中: {selectedRescheduleLabel}</div> : null}
+            <button
+              className="rounded bg-black text-white px-4 py-2 disabled:opacity-50"
+              disabled={submitting || loadingRescheduleSlots || !rescheduleSelected}
+              onClick={submitReschedule}
+              type="button"
+            >
+              {submitting && processingAction === "reschedule" ? "処理中..." : "この枠に変更する"}
+            </button>
+          </section>
         ) : null}
         {canResendVerification ? (
           <button

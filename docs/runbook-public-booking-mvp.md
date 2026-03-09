@@ -1,10 +1,11 @@
-# Sprint 2 Public Booking Operational Runbook
+# Sprint 2/4 Public Booking Operational Runbook
 
 ## 1. Purpose and Scope
-This runbook defines Sprint 2 operational acceptance for the public booking flow in a constrained local environment (single-tenant / single-mailbox assumptions).
+This runbook defines Sprint 2 canonical flow acceptance with Sprint 4 contract fix for public cancel/reschedule links in a constrained local environment (single-tenant / single-mailbox assumptions).
 
 In-scope:
 - public API flow verification (no UI dependency)
+- public action link contract verification (`booking_id` + `token`)
 - smoke execution artifacts
 - request-id traceability
 - DB state verification
@@ -50,7 +51,6 @@ Required for Sprint 2 acceptance:
 - `API_BASE_URL`
 - `NEXT_PUBLIC_API_BASE`
 - `JWT_SECRET`
-- `ADMIN_API_KEY`
 - `PUBLIC_RETURN_VERIFY_TOKEN=1` (for local smoke verification)
 
 Local default assumptions used by smoke:
@@ -93,6 +93,9 @@ bash scripts/smoke-public.sh
 ```
 
 Both scripts are API-only and do not require UI interaction.
+Both scripts verify public confirm response links and enforce this contract:
+- `cancel_url = /public/:tenantSlug?action=cancel&booking_id=...&token=...`
+- `reschedule_url = /public/:tenantSlug?action=reschedule&booking_id=...&token=...`
 
 ## 8. x-request-id Tracing Procedure
 1. For each write request, capture response headers and extract `x-request-id`.
@@ -131,14 +134,24 @@ Cancel checks:
 - token purpose is `cancel`
 - booking currently `confirmed`
 - cancel deadline not passed
+- `booking_id` is carried in `cancel_url` query and matches booking id
 - result status is `canceled`
 
 Reschedule checks:
 - token purpose is `reschedule`
 - booking currently `confirmed`
 - reschedule deadline not passed
+- `booking_id` is carried in `reschedule_url` query and matches booking id
+- `new_start_at` / `new_end_at` are request body fields (not URL query)
 - new slot is accepted (409 conflicts may require retry)
 - result contains updated slot fields
+
+## 10.1 Public UI Safe-stop Checks (Sprint 4)
+For `/public/:tenantSlug` token-action page:
+- missing `booking_id` in `action=cancel` / `action=reschedule` must stop as invalid link
+- invalid/expired token must stop with error state (no fallback to confirm)
+- `action=reschedule` must select new slot in UI and send `new_start_at/new_end_at` in request body
+- client-side token decode is prohibited
 
 ## 11. Hold Expiry Checks
 To verify expiry behavior:

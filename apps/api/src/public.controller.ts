@@ -11,6 +11,13 @@ import { RescheduleBookingDto } from "./dto/public/reschedule-booking.dto";
 import { log } from "./utils/logger";
 import type { RequestWithId } from "./middleware/request-id.middleware";
 
+type PublicConfirmResponse = {
+  status: string;
+  booking_id: string;
+  cancel_url: string;
+  reschedule_url: string;
+};
+
 @Controller("/v1/public")
 export class PublicController {
   constructor(@Inject(BookingService) private readonly bookingService: BookingService) {}
@@ -61,7 +68,7 @@ export class PublicController {
     @Param("tenantSlug") tenantSlug: string,
     @Headers("Idempotency-Key") idempotencyKey: string,
     @Body() body: ConfirmDto
-  ) {
+  ): Promise<PublicConfirmResponse> {
     const requestId = (req as RequestWithId).requestId;
     log("info", "public_confirm_request", { tenantSlug, requestId });
     if (body.booking_id !== undefined) {
