@@ -111,9 +111,10 @@ export class BookingService {
     const now = Date.now();
     const cancelToken = this.issueToken(bookingId, tenantId, "cancel", exp, `cancel-${bookingId}-${now}`);
     const rescheduleToken = this.issueToken(bookingId, tenantId, "reschedule", exp, `reschedule-${bookingId}-${now}`);
+    const bookingIdQuery = encodeURIComponent(bookingId);
     return {
-      cancelUrl: `${config.baseUrl}/public/${tenantSlug}?action=cancel&token=${encodeURIComponent(cancelToken)}`,
-      rescheduleUrl: `${config.baseUrl}/public/${tenantSlug}?action=reschedule&token=${encodeURIComponent(rescheduleToken)}`
+      cancelUrl: `${config.baseUrl}/public/${tenantSlug}?action=cancel&booking_id=${bookingIdQuery}&token=${encodeURIComponent(cancelToken)}`,
+      rescheduleUrl: `${config.baseUrl}/public/${tenantSlug}?action=reschedule&booking_id=${bookingIdQuery}&token=${encodeURIComponent(rescheduleToken)}`
     };
   }
 
