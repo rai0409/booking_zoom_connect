@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, ConflictException, ForbiddenException, NotFoundException, UnauthorizedException, Logger } from "@nestjs/common";
+import { Injectable, BadRequestException, ConflictException, ForbiddenException, NotFoundException, UnauthorizedException } from "@nestjs/common";
 import { Prisma, BookingStatus } from "@prisma/client";
 import { GraphClient } from "../clients/graph.client";
 import { config } from "../config";
@@ -7,12 +7,13 @@ import { MailSender } from "../mail/mail-sender";
 import { ZoomClient } from "../clients/zoom.client";
 import { prisma } from "../prisma";
 import { parseIsoToUtc, utcNow, toIsoUtc, dateFromYmdLocal } from "../utils/time";
-import { signBookingToken, verifyBookingToken, TokenPurpose } from "../utils/jwt";
+import { signBookingToken, verifyBookingToken, decodeBookingTokenUnsafe, TokenPurpose } from "../utils/jwt";
 import { DateTime } from "luxon";
 import { log } from "../utils/logger";
-import { randomBytes, randomUUID } from "crypto";
+import { randomBytes } from "crypto";
 
-const HOLD_TTL_MINUTES = 10;
+const DEFAULT_HOLD_TTL_MINUTES_DEV = 30;
+const DEFAULT_HOLD_TTL_MINUTES_PROD = 20;
 const CANCEL_DEADLINE_HOURS = 24;
 
 type AvailabilitySlot = { start_at_utc: string; end_at_utc: string };
@@ -54,14 +55,63 @@ type InternalBookingListItem = {
   events?: InternalBookingEvent[];
 };
 
+const AVAIL_DEBUG_SALESPERSON_ID = "63d22e6c-1ab3-4306-a9b2-dac9767fa528";
+const AVAIL_DEBUG_DATE = "2026-03-16";
+
+function shouldDebugAvailability(params: { salespersonId?: string | null; date: string }) {
+  return params.salespersonId === AVAIL_DEBUG_SALESPERSON_ID && params.date === AVAIL_DEBUG_DATE;
+}
+
+function logAvailabilityDebug(tag: string, meta: Record<string, unknown>) {
+  log("info", tag, { tag, ...meta });
+}
+
+function serializeAvailabilitySlots(slots: AvailabilitySlot[]) {
+  return slots.map((slot) => ({ start: slot.start_at_utc, end: slot.end_at_utc }));
+}
+
+function serializeBusySlots(busy: BusySlot[]) {
+  return busy.map((slot) => ({ start: slot.startUtc, end: slot.endUtc }));
+}
+
 @Injectable()
 export class BookingService {
   private graph = new GraphClient();
   private zoom = new ZoomClient();
   private mailSender: MailSender = new GraphMailSender(this.graph);
   private availabilityCache = new Map<string, { expiresAt: number; slots: AvailabilitySlot[] }>();
-  private readonly logger = new Logger(BookingService.name);
+  private readonly holdTtlMinutes = this.resolveHoldTtlMinutes();
   private static readonly UNION_SCOPE = "__union__";
+
+  private resolveHoldTtlMinutes(): number {
+    const envTtlRaw = process.env.HOLD_TTL_MINUTES;
+    if (envTtlRaw) {
+      const parsed = Number(envTtlRaw);
+      if (Number.isFinite(parsed) && parsed >= 1) {
+        return Math.floor(parsed);
+      }
+    }
+    return config.nodeEnv === "production" ? DEFAULT_HOLD_TTL_MINUTES_PROD : DEFAULT_HOLD_TTL_MINUTES_DEV;
+  }
+
+  private calcHoldExpiresAtUtc(nowUtc: Date): Date {
+    return DateTime.fromJSDate(nowUtc, { zone: "utc" }).plus({ minutes: this.holdTtlMinutes }).toUTC().toJSDate();
+  }
+
+  private buildPublicBookingUrl(tenantSlug: string, params: Record<string, string>): string {
+    const url = new URL(`/public/${tenantSlug}`, `${config.baseUrl.replace(/\/$/, "")}/`);
+    Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
+    return url.toString();
+  }
+
+  private buildVerifyUrl(tenantSlug: string, token: string): string {
+    const url = new URL(
+      `/public/${encodeURIComponent(tenantSlug)}/confirm`,
+      `${config.baseUrl.replace(/\/$/, "")}/`
+    );
+    url.searchParams.set("token", token);
+    return url.toString();
+  }
 
   private buildEventSubject(): string {
     return "Appointment";
@@ -111,10 +161,17 @@ export class BookingService {
     const now = Date.now();
     const cancelToken = this.issueToken(bookingId, tenantId, "cancel", exp, `cancel-${bookingId}-${now}`);
     const rescheduleToken = this.issueToken(bookingId, tenantId, "reschedule", exp, `reschedule-${bookingId}-${now}`);
-    const bookingIdQuery = encodeURIComponent(bookingId);
     return {
-      cancelUrl: `${config.baseUrl}/public/${tenantSlug}?action=cancel&booking_id=${bookingIdQuery}&token=${encodeURIComponent(cancelToken)}`,
-      rescheduleUrl: `${config.baseUrl}/public/${tenantSlug}?action=reschedule&booking_id=${bookingIdQuery}&token=${encodeURIComponent(rescheduleToken)}`
+      cancelUrl: this.buildPublicBookingUrl(tenantSlug, {
+        action: "cancel",
+        booking_id: bookingId,
+        token: cancelToken
+      }),
+      rescheduleUrl: this.buildPublicBookingUrl(tenantSlug, {
+        action: "reschedule",
+        booking_id: bookingId,
+        token: rescheduleToken
+      })
     };
   }
 
@@ -364,9 +421,24 @@ export class BookingService {
   }
 
   private invalidateAvailabilityCacheForStart(tenantId: string, salespersonId: string, timezone: string, startAtUtc: Date) {
-    const ymd = DateTime.fromJSDate(startAtUtc, { zone: "utc" }).setZone(timezone).toFormat("yyyy-LL-dd");
-    this.availabilityCache.delete(this.availabilityCacheKey(tenantId, salespersonId, ymd));
-    this.availabilityCache.delete(this.availabilityCacheKey(tenantId, BookingService.UNION_SCOPE, ymd));
+    const derivedDateLocal = DateTime.fromJSDate(startAtUtc, { zone: "utc" }).setZone(timezone).toFormat("yyyy-LL-dd");
+    const derivedDateUtc = DateTime.fromJSDate(startAtUtc, { zone: "utc" }).toFormat("yyyy-LL-dd");
+    const keys = [
+      this.availabilityCacheKey(tenantId, salespersonId, derivedDateLocal),
+      this.availabilityCacheKey(tenantId, BookingService.UNION_SCOPE, derivedDateLocal)
+    ];
+    keys.forEach((key) => this.availabilityCache.delete(key));
+    if (shouldDebugAvailability({ salespersonId, date: derivedDateLocal })) {
+      logAvailabilityDebug("availability_debug_cache", {
+        phase: "invalidate",
+        keys,
+        salespersonId,
+        startAtUtc: toIsoUtc(startAtUtc),
+        derivedDateLocal,
+        derivedDateUtc
+      });
+    }
+    return keys;
   }
 
   private parseBusinessHours(tenant: { public_business_hours: Prisma.JsonValue | null }) {
@@ -376,7 +448,22 @@ export class BookingService {
     const bufferMinutes = Number(cfg.buffer_minutes ?? 10);
     const maxDaysAhead = Number(cfg.max_days_ahead ?? 7);
     const closedDates: string[] = Array.isArray(cfg.closed_dates) ? cfg.closed_dates : [];
-    const weekly = (cfg.weekly || {}) as Record<string, any>;
+
+    const defaultWeekly: Record<string, any> = {
+      mon: { open: "09:00", close: "18:00", breaks: [] },
+      tue: { open: "09:00", close: "18:00", breaks: [] },
+      wed: { open: "09:00", close: "18:00", breaks: [] },
+      thu: { open: "09:00", close: "18:00", breaks: [] },
+      fri: { open: "09:00", close: "18:00", breaks: [] },
+      sat: null,
+      sun: null
+    };
+
+    const weekly = {
+      ...defaultWeekly,
+      ...((cfg.weekly || {}) as Record<string, any>)
+    };
+
     return { slotMinutes, leadTimeMinutes, bufferMinutes, maxDaysAhead, closedDates, weekly };
   }
 
@@ -403,8 +490,11 @@ export class BookingService {
 
     const weekdayKey = targetLocal.toFormat("ccc").toLowerCase();
     const dayCfg = weekly[weekdayKey];
+
+    if (!dayCfg || dayCfg.closed === true) return null;
+
     const openMin = this.parseHm(dayCfg?.open, 9 * 60);
-    const closeMin = this.parseHm(dayCfg?.close, 17 * 60);
+    const closeMin = this.parseHm(dayCfg?.close, 18 * 60);
     if (closeMin <= openMin) return null;
 
     const breaks = Array.isArray(dayCfg?.breaks) ? dayCfg.breaks : [];
@@ -474,7 +564,18 @@ export class BookingService {
   async getAvailabilityPublic(tenantSlug: string, salespersonId: string | undefined, date: string, requestId?: string) {
     await this.getPublicTenantOrThrow(tenantSlug);
     log("info", "availability_requested", { tenantSlug, requestId, salespersonId: salespersonId ?? null, date });
-    return this.getAvailability(tenantSlug, salespersonId, date);
+    try {
+      return await this.getAvailability(tenantSlug, salespersonId, date);
+    } catch (error) {
+      log("error", "availability_failed", {
+        tenantSlug,
+        requestId,
+        salespersonId: salespersonId ?? null,
+        date,
+        err: error instanceof Error ? error.message : String(error)
+      });
+      return [];
+    }
   }
 
   async listSalespersonsPublic(tenantSlug: string): Promise<PublicSalesperson[]> {
@@ -712,14 +813,61 @@ export class BookingService {
     if (salespersonId && targetSalespersons.length === 0) throw new NotFoundException("Salesperson not found");
     if (targetSalespersons.length === 0) return [];
 
+    const debugEnabled = shouldDebugAvailability({ salespersonId, date });
     const tzForAvailability =
       (salespersonId ? targetSalespersons[0]?.timezone : undefined) || tenant.public_timezone || "Asia/Tokyo";
-    const ctx = this.buildAvailabilityContext(tenant, date, tzForAvailability);
-    if (!ctx) return [];
-
     const scope = salespersonId || BookingService.UNION_SCOPE;
     const cacheKey = this.availabilityCacheKey(tenant.id, scope, date);
+    if (debugEnabled) {
+      logAvailabilityDebug("availability_debug_request", {
+        tenantSlug,
+        tenantId: tenant.id,
+        salespersonId: salespersonId ?? null,
+        date,
+        tzForAvailability,
+        cacheKey,
+        nowUtc: toIsoUtc(utcNow())
+      });
+    }
+    const ctx = this.buildAvailabilityContext(tenant, date, tzForAvailability);
+    if (!ctx) return [];
+    if (debugEnabled) {
+      const hours = this.parseBusinessHours(tenant);
+      const targetLocal = DateTime.fromFormat(date, "yyyy-LL-dd", { zone: tzForAvailability });
+      const dayCfg = hours.weekly[targetLocal.toFormat("ccc").toLowerCase()] || {};
+      logAvailabilityDebug("availability_debug_context", {
+        tenantSlug,
+        tenantId: tenant.id,
+        salespersonId: salespersonId ?? null,
+        effectiveTimezone: tzForAvailability,
+        targetLocalDate: date,
+        open: dayCfg.open ?? "09:00",
+        close: dayCfg.close ?? "17:00",
+        breaks: Array.isArray(dayCfg.breaks) ? dayCfg.breaks : [],
+        slotMinutes: hours.slotMinutes,
+        bufferMinutes: hours.bufferMinutes,
+        leadTimeMinutes: hours.leadTimeMinutes,
+        maxDaysAhead: hours.maxDaysAhead
+      });
+      logAvailabilityDebug("availability_debug_generated_slots", {
+        tenantSlug,
+        tenantId: tenant.id,
+        salespersonId: salespersonId ?? null,
+        date,
+        count: ctx.slots.length,
+        slots: serializeAvailabilitySlots(ctx.slots)
+      });
+    }
     const cached = this.availabilityCache.get(cacheKey);
+    if (debugEnabled) {
+      logAvailabilityDebug("availability_debug_cache", {
+        phase: "read",
+        key: cacheKey,
+        hit: !!(cached && cached.expiresAt > Date.now()),
+        salespersonId: salespersonId ?? null,
+        date
+      });
+    }
     if (cached && cached.expiresAt > Date.now()) {
       return cached.slots;
     }
@@ -740,8 +888,33 @@ export class BookingService {
           }
         ]
       },
-      select: { salesperson_id: true, start_at_utc: true, end_at_utc: true }
+      select: {
+        id: true,
+        salesperson_id: true,
+        status: true,
+        start_at_utc: true,
+        end_at_utc: true,
+        hold: { select: { expires_at_utc: true } }
+      }
     });
+    if (debugEnabled) {
+      logAvailabilityDebug("availability_debug_occupied_bookings", {
+        tenantSlug,
+        tenantId: tenant.id,
+        salespersonId: salespersonId ?? null,
+        date,
+        count: occupied.length,
+        bookings: occupied.map((row) => ({
+          id: row.id,
+          status: row.status,
+          startAtUtc: DateTime.fromJSDate(row.start_at_utc, { zone: "utc" }).toISO(),
+          endAtUtc: DateTime.fromJSDate(row.end_at_utc, { zone: "utc" }).toISO(),
+          holdExpiresAt: row.hold?.expires_at_utc
+            ? DateTime.fromJSDate(row.hold.expires_at_utc, { zone: "utc" }).toISO()
+            : null
+        }))
+      });
+    }
 
     const dbBusyBySalesperson = new Map<string, BusySlot[]>();
     for (const salesperson of targetSalespersons) {
@@ -755,6 +928,20 @@ export class BookingService {
       });
       dbBusyBySalesperson.set(row.salesperson_id, items);
     }
+    const debugDbFilteredSlots =
+      debugEnabled && salespersonId
+        ? ctx.slots.filter((slot) => !this.slotOverlapsBusy(slot, dbBusyBySalesperson.get(salespersonId) || [], ctx.bufferMinutes))
+        : null;
+    if (debugEnabled && debugDbFilteredSlots) {
+      logAvailabilityDebug("availability_debug_after_booking_filter", {
+        tenantSlug,
+        tenantId: tenant.id,
+        salespersonId: salespersonId ?? null,
+        date,
+        count: debugDbFilteredSlots.length,
+        slots: serializeAvailabilitySlots(debugDbFilteredSlots)
+      });
+    }
 
     const graphBusyBySalesperson = await this.getGraphBusyMap({
       tenantSlug,
@@ -764,6 +951,28 @@ export class BookingService {
       startIso: ctx.dayOpen.toUTC().toISO() || "",
       endIso: ctx.dayEnd.toUTC().toISO() || ""
     });
+    if (debugEnabled && salespersonId) {
+      const debugGraphBusy = graphBusyBySalesperson.get(salespersonId) || [];
+      logAvailabilityDebug("availability_debug_graph_busy", {
+        tenantSlug,
+        tenantId: tenant.id,
+        salespersonId,
+        date,
+        count: debugGraphBusy.length,
+        busy: serializeBusySlots(debugGraphBusy)
+      });
+      const debugAfterGraphSlots = (debugDbFilteredSlots || ctx.slots).filter(
+        (slot) => !this.slotOverlapsBusy(slot, debugGraphBusy, ctx.bufferMinutes)
+      );
+      logAvailabilityDebug("availability_debug_after_graph_filter", {
+        tenantSlug,
+        tenantId: tenant.id,
+        salespersonId,
+        date,
+        count: debugAfterGraphSlots.length,
+        slots: serializeAvailabilitySlots(debugAfterGraphSlots)
+      });
+    }
 
     const slots = ctx.slots.filter((slot) =>
       targetSalespersons.some((salesperson) => {
@@ -776,6 +985,16 @@ export class BookingService {
     );
 
     this.availabilityCache.set(cacheKey, { expiresAt: Date.now() + 45_000, slots });
+    if (debugEnabled) {
+      logAvailabilityDebug("availability_debug_final_slots", {
+        tenantSlug,
+        tenantId: tenant.id,
+        salespersonId: salespersonId ?? null,
+        date,
+        count: slots.length,
+        slots: serializeAvailabilitySlots(slots)
+      });
+    }
     return slots;
   }
 
@@ -829,6 +1048,7 @@ export class BookingService {
   ) {
     const lockKey = `hold:${params.tenantId}:${params.salespersonId}:${params.startAt.toISOString()}:${params.endAt.toISOString()}`;
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+    const expiresAtUtc = this.calcHoldExpiresAtUtc(params.now);
 
     const slotExisting = await tx.booking.findFirst({
       where: {
@@ -861,10 +1081,10 @@ export class BookingService {
           hold: {
             upsert: {
               create: {
-                expires_at_utc: DateTime.fromJSDate(params.now).plus({ minutes: HOLD_TTL_MINUTES }).toJSDate()
+                expires_at_utc: expiresAtUtc
               },
               update: {
-                expires_at_utc: DateTime.fromJSDate(params.now).plus({ minutes: HOLD_TTL_MINUTES }).toJSDate()
+                expires_at_utc: expiresAtUtc
               }
             }
           }
@@ -904,7 +1124,7 @@ export class BookingService {
         idempotency_key: params.idempotencyKey,
         hold: {
           create: {
-            expires_at_utc: DateTime.fromJSDate(params.now).plus({ minutes: HOLD_TTL_MINUTES }).toJSDate()
+            expires_at_utc: expiresAtUtc
           }
         }
       } as any,
@@ -1060,6 +1280,19 @@ export class BookingService {
       throw err;
     }
 
+    if (booking.hold) {
+      log("info", "hold_created", {
+        booking_id: booking.id,
+        hold_id: booking.hold.booking_id ?? booking.id,
+        created_at_utc: toIsoUtc(booking.created_at),
+        expires_at_utc: toIsoUtc(booking.hold.expires_at_utc),
+        ttl_minutes: this.holdTtlMinutes,
+        salesperson_id: booking.salesperson_id,
+        start_at_utc: toIsoUtc(booking.start_at_utc),
+        end_at_utc: toIsoUtc(booking.end_at_utc)
+      });
+    }
+
     const assigned =
       availableSalespersons.find((s) => s.id === booking.salesperson_id) ||
       (await prisma.salesperson.findUnique({
@@ -1074,90 +1307,178 @@ export class BookingService {
   }
 
   async sendVerification(tenantSlug: string, bookingId: string, idempotencyKey: string, requestId?: string) {
+    const trace = `[verify-email tenant=${tenantSlug} booking=${bookingId} request=${requestId ?? "n/a"}]`;
+    console.time(`${trace} total`);
+
     if (!idempotencyKey) throw new BadRequestException("Idempotency-Key required");
+
     const tenant = await prisma.tenant.findUnique({ where: { slug: tenantSlug } });
     if (!tenant) throw new NotFoundException("Tenant not found");
+
     log("info", "verify_email_requested", { tenantSlug, bookingId, requestId });
 
-    const existing = await this.checkIdempotency(tenant.id, "verify-email", idempotencyKey);
-    if (existing) {
-      const b = await prisma.booking.findFirst({
+    try {
+      console.time(`${trace} idempotency-check`);
+      const existing = await this.checkIdempotency(tenant.id, "verify-email", idempotencyKey);
+      console.timeEnd(`${trace} idempotency-check`);
+
+      if (existing) {
+        console.time(`${trace} existing-booking-load`);
+        const b = await prisma.booking.findFirst({
+          where: { id: bookingId, tenant_id: tenant.id },
+          include: { hold: true, customer: true }
+        });
+        console.timeEnd(`${trace} existing-booking-load`);
+
+        if (!b || !b.hold) throw new NotFoundException("Booking not found");
+
+        const allowedStatuses: BookingStatus[] = [BookingStatus.hold, BookingStatus.pending_verify];
+        if (!allowedStatuses.includes(b.status)) throw new ConflictException("Invalid booking state");
+
+        console.time(`${trace} existing-state-validate`);
+        if (b.hold.expires_at_utc <= utcNow()) {
+          await prisma.booking.update({
+            where: { id: b.id },
+            data: { status: BookingStatus.expired }
+          });
+          throw new ConflictException("Hold expired");
+        }
+
+        const exp = Math.floor(b.hold.expires_at_utc.getTime() / 1000);
+        const jti = b.verify_token_jti || `verify-${b.id}`;
+        const token = signBookingToken({
+          exp,
+          jti,
+          booking_id: b.id,
+          tenant_id: tenant.id,
+          purpose: "verify"
+        });
+        console.timeEnd(`${trace} existing-state-validate`);
+
+        return { status: "sent", token };
+      }
+
+      console.time(`${trace} booking-load`);
+      const booking = await prisma.booking.findFirst({
         where: { id: bookingId, tenant_id: tenant.id },
         include: { hold: true, customer: true }
       });
-      if (!b || !b.hold) throw new NotFoundException("Booking not found");
+      console.timeEnd(`${trace} booking-load`);
+
+      if (!booking || !booking.hold) throw new NotFoundException("Booking not found");
+
       const allowedStatuses: BookingStatus[] = [BookingStatus.hold, BookingStatus.pending_verify];
-      if (!allowedStatuses.includes(b.status)) throw new ConflictException("Invalid booking state");
-      if (b.hold.expires_at_utc <= utcNow()) {
-        await prisma.booking.update({ where: { id: b.id }, data: { status: BookingStatus.expired } });
+      if (!allowedStatuses.includes(booking.status)) {
+        throw new ConflictException("Invalid booking state");
+      }
+
+      console.time(`${trace} prepare`);
+      const now = utcNow();
+      if (booking.hold.expires_at_utc <= now) {
+        await prisma.booking.update({
+          where: { id: booking.id },
+          data: { status: BookingStatus.expired }
+        });
         throw new ConflictException("Hold expired");
       }
-      const exp = Math.floor(b.hold.expires_at_utc.getTime() / 1000);
-      const jti = b.verify_token_jti || `verify-${b.id}`;
-      const token = signBookingToken({ exp, jti, booking_id: b.id, tenant_id: tenant.id, purpose: "verify" });
-      return { status: "sent", token };
-    }
 
-    const booking = await prisma.booking.findFirst({
-      where: { id: bookingId, tenant_id: tenant.id },
-      include: { hold: true, customer: true }
-    });
-    if (!booking || !booking.hold) throw new NotFoundException("Booking not found");
-    const allowedStatuses: BookingStatus[] = [BookingStatus.hold, BookingStatus.pending_verify];
-    if (!allowedStatuses.includes(booking.status)) {
-      throw new ConflictException("Invalid booking state");
-    }
+      const exp = Math.floor(booking.hold.expires_at_utc.getTime() / 1000);
+      const jti = booking.verify_token_jti || `verify-${booking.id}`;
+      const token = signBookingToken({
+        exp,
+        jti,
+        booking_id: booking.id,
+        tenant_id: tenant.id,
+        purpose: "verify"
+      });
 
-    const now = utcNow();
-    if (booking.hold.expires_at_utc <= now) {
-      await prisma.booking.update({ where: { id: booking.id }, data: { status: BookingStatus.expired } });
-      throw new ConflictException("Hold expired");
-    }
+      await prisma.booking.update({
+        where: { id: booking.id },
+        data: {
+          verify_token_jti: jti,
+          status: BookingStatus.pending_verify
+        }
+      });
+      console.timeEnd(`${trace} prepare`);
 
-    const exp = Math.floor(booking.hold.expires_at_utc.getTime() / 1000);
-    const jti = booking.verify_token_jti || `verify-${booking.id}`;
-    const token = signBookingToken({
-      exp,
-      jti,
-      booking_id: booking.id,
-      tenant_id: tenant.id,
-      purpose: "verify"
-    });
+      const graphEnabled = process.env.GRAPH_ENABLED !== "0";
+      let verifyMailPayload: { m365TenantId: string; to: string; subject: string; body: string } | null = null;
+      let verifyMailSkipReason: "graph_disabled" | "tenant_m365_missing" | "verify_payload_build_failed" | null = null;
+      if (graphEnabled && tenant.m365_tenant_id) {
+        try {
+          console.time(`${trace} build-verify-url`);
+          const verifyUrl = this.buildVerifyUrl(tenantSlug, token);
+          console.timeEnd(`${trace} build-verify-url`);
+          verifyMailPayload = {
+            m365TenantId: tenant.m365_tenant_id,
+            to: booking.customer.email,
+            subject: `Booking verification ${booking.id}`,
+            body: `Please verify your booking: ${verifyUrl}`
+          };
+        } catch (e) {
+          try {
+            console.timeEnd(`${trace} build-verify-url`);
+          } catch {}
 
-    await prisma.booking.update({
-      where: { id: booking.id },
-      data: {
-        verify_token_jti: jti,
-        status: BookingStatus.pending_verify
+          log("warn", "verify_email_send_prepare_failed", {
+            tenantId: tenant.id,
+            tenantSlug,
+            bookingId: booking.id,
+            requestId,
+            reason: "verify_payload_build_failed",
+            resendCandidate: true,
+            err: e instanceof Error ? e.message : String(e)
+          });
+          verifyMailSkipReason = "verify_payload_build_failed";
+        }
+      } else {
+        verifyMailSkipReason = graphEnabled ? "tenant_m365_missing" : "graph_disabled";
       }
-    });
 
-    const graphEnabled = process.env.GRAPH_ENABLED !== "0";
-    if (graphEnabled && tenant.m365_tenant_id) {
-      try {
-        const verifyUrl = `${config.baseUrl}/public/${tenantSlug}?token=${encodeURIComponent(token)}`;
-        await this.mailSender.send({
-          m365TenantId: tenant.m365_tenant_id,
-          to: booking.customer.email,
-          subject: `Booking verification ${booking.id}`,
-          body: `Please verify your booking: ${verifyUrl}`
-        });
-      } catch (e) {
-        log("warn", "verify_email_send_failed", {
+      console.time(`${trace} finalize`);
+      await this.recordIdempotency(tenant.id, "verify-email", idempotencyKey);
+      console.timeEnd(`${trace} finalize`);
+
+      if (verifyMailPayload) {
+        console.time(`${trace} send-mail-async`);
+        void Promise.resolve()
+          .then(() => this.mailSender.send(verifyMailPayload))
+          .then(() => {
+            try {
+              console.timeEnd(`${trace} send-mail-async`);
+            } catch {}
+          })
+          .catch((e) => {
+            try {
+              console.timeEnd(`${trace} send-mail-async`);
+            } catch {}
+
+            log("warn", "verify_email_send_failed_async", {
+              tenantId: tenant.id,
+              tenantSlug,
+              bookingId: booking.id,
+              requestId,
+              reason: "mail_sender_error",
+              resendCandidate: true,
+              err: e instanceof Error ? e.message : String(e)
+            });
+          });
+      } else {
+        log("info", "verify_email_send_skipped", {
+          tenantId: tenant.id,
           tenantSlug,
           bookingId: booking.id,
-          requestId,
-          err: e instanceof Error ? e.message : String(e)
+          reason: verifyMailSkipReason ?? "unknown",
+          mailSent: false,
+          graphEnabled,
+          requestId
         });
       }
-    } else {
-      log("info", "verify_email_send_skipped", { tenantSlug, bookingId: booking.id, graphEnabled, requestId });
+
+      return { status: "sent", token };
+    } finally {
+      console.timeEnd(`${trace} total`);
     }
-
-
-    await this.recordIdempotency(tenant.id, "verify-email", idempotencyKey);
-
-    return { status: "sent", token };
   }
 
   private async sendConfirmationEmailBestEffort(params: {
@@ -1174,9 +1495,11 @@ export class BookingService {
     zoomJoinUrl: string | null;
   }) {
     if (process.env.GRAPH_ENABLED === "0" || !params.tenant.m365_tenant_id) {
-      this.logger.warn(
-        `Confirmation email skipped: Graph unavailable for tenant=${params.tenant.id}, booking=${params.booking.id}`
-      );
+      log("warn", "confirmation_email_send_skipped", {
+        tenant_id: params.tenant.id,
+        booking_id: params.booking.id,
+        reason: "graph_unavailable"
+      });
       await prisma.booking.update({
         where: { id: params.booking.id },
         data: { customer_notify_required: true }
@@ -1208,16 +1531,20 @@ export class BookingService {
         subject: email.subject,
         body: email.body
       });
+      log("info", "confirmation_email_sent", {
+        tenant_id: params.tenant.id,
+        booking_id: params.booking.id
+      });
       await prisma.booking.update({
         where: { id: params.booking.id },
         data: { customer_notify_required: false }
       }).catch(() => {});
     } catch (e) {
-      this.logger.warn(
-        `Confirmation email failed: tenant=${params.tenant.id}, booking=${params.booking.id}, error=${
-          e instanceof Error ? e.message : String(e)
-        }`
-      );
+      log("warn", "confirmation_email_send_failed", {
+        tenant_id: params.tenant.id,
+        booking_id: params.booking.id,
+        err: e instanceof Error ? e.message : String(e)
+      });
       await prisma.booking.update({
         where: { id: params.booking.id },
         data: { customer_notify_required: true }
@@ -1231,8 +1558,23 @@ export class BookingService {
     if (!tenant) throw new NotFoundException("Tenant not found");
     log("info", "confirm_requested", { tenantSlug, requestId });
 
-    const tokenPayload = this.verifyBookingTokenOrThrow(token, "Hold expired");
+    const unsafeTokenPayload = decodeBookingTokenUnsafe(token);
+    let tokenPayload: ReturnType<typeof verifyBookingToken>;
+    try {
+      tokenPayload = this.verifyBookingTokenOrThrow(token, "Hold expired");
+    } catch (e) {
+      log("warn", "confirm_token_verify_failed", {
+        tenantSlug,
+        requestId,
+        token_exp: unsafeTokenPayload?.exp ?? null,
+        token_purpose: unsafeTokenPayload?.purpose ?? null,
+        token_booking_id: unsafeTokenPayload?.booking_id ?? null,
+        token_tenant_id: unsafeTokenPayload?.tenant_id ?? null
+      });
+      throw e;
+    }
     if (tokenPayload.purpose !== "verify") throw new ForbiddenException("Invalid token purpose");
+    if (tokenPayload.tenant_id !== tenant.id) throw new ForbiddenException("Token tenant mismatch");
 
     const existing = await this.checkIdempotency(tenant.id, "confirm", idempotencyKey);
     if (existing) {
@@ -1244,6 +1586,25 @@ export class BookingService {
       include: { customer: true, salesperson: true, hold: true, graph_event: true }
     });
     if (!booking || !booking.customer || !booking.salesperson) throw new NotFoundException("Booking not found");
+    const nowUtc = utcNow();
+
+    log("info", "confirm_state_check", {
+      tenantSlug,
+      requestId,
+      booking_id: booking.id,
+      booking_status: booking.status,
+      hold_expires_at_utc: booking.hold ? toIsoUtc(booking.hold.expires_at_utc) : null,
+      now_utc: toIsoUtc(nowUtc),
+      token_exp: tokenPayload.exp,
+      token_purpose: tokenPayload.purpose,
+      token_booking_id: tokenPayload.booking_id,
+      token_tenant_id: tokenPayload.tenant_id
+    });
+
+    if (booking.status === BookingStatus.confirmed) {
+      await this.recordIdempotency(tenant.id, "confirm", idempotencyKey);
+      return booking;
+    }
 
     if (booking.verify_token_jti !== tokenPayload.jti) {
       log("warn", "confirm_rejected", {
@@ -1256,11 +1617,6 @@ export class BookingService {
         holdExpiresAtUtc: booking.hold ? toIsoUtc(booking.hold.expires_at_utc) : null
       });
       throw new ForbiddenException("Token already used");
-    }
-
-    if (booking.status === BookingStatus.confirmed) {
-      await this.recordIdempotency(tenant.id, "confirm", idempotencyKey);
-      return booking;
     }
 
     if (booking.status !== BookingStatus.pending_verify) {
@@ -1276,163 +1632,125 @@ export class BookingService {
       throw new ConflictException("Invalid booking state");
     }
 
-    if (booking.hold && booking.hold.expires_at_utc <= utcNow()) {
-      log("warn", "confirm_rejected", {
+    if (!booking.hold || booking.hold.expires_at_utc <= nowUtc) {
+      log("warn", "confirm_hold_expired", {
         tenantSlug,
         requestId,
-        bookingId: booking.id,
-        bookingStatus: booking.status,
-        verifyTokenJti: booking.verify_token_jti,
-        tokenJti: tokenPayload.jti,
-        holdExpiresAtUtc: toIsoUtc(booking.hold.expires_at_utc)
+        booking_id: booking.id,
+        booking_status: booking.status,
+        hold_expires_at_utc: booking.hold ? toIsoUtc(booking.hold.expires_at_utc) : null,
+        now_utc: toIsoUtc(nowUtc),
+        token_exp: tokenPayload.exp,
+        token_purpose: tokenPayload.purpose,
+        token_booking_id: tokenPayload.booking_id,
+        token_tenant_id: tokenPayload.tenant_id
       });
       await prisma.booking.update({ where: { id: booking.id }, data: { status: BookingStatus.expired } });
       throw new ConflictException("Hold expired");
     }
-
-    const graphEnabled = process.env.GRAPH_ENABLED !== "0";
-    const zoomEnabled = process.env.ZOOM_ENABLED !== "0";
-    const graphReady =
-      graphEnabled &&
-      !!tenant.m365_tenant_id &&
-      !!booking.salesperson.graph_user_id &&
-      !booking.graph_event;
-
-    const startIso = toIsoUtc(booking.start_at_utc);
-    const endIso = toIsoUtc(booking.end_at_utc);
-
-    let zoomMeeting: { meetingId: string; joinUrl: string; startUrl: string } | null = null;
-    try {
-
-      if (zoomEnabled) {
-          zoomMeeting = await this.zoom.createMeeting({
-            topic: this.buildEventSubject(),
-            startUtc: startIso,
-            endUtc: endIso,
-            timezone: booking.salesperson.timezone
-          });
-        }
-
-        // Graphは有効かつ未作成のときだけ作る（増殖防止）
-        let graphEvent: { eventId: string; iCalUId: string; etag: string } | null = null;
-        if (graphReady) {
-          const body = this.buildEventBody();
-          graphEvent = await this.graph.createEvent(tenant.m365_tenant_id || "", {
-            organizerUserId: booking.salesperson.graph_user_id,
-            subject: this.buildEventSubject(),
-            startUtc: startIso,
-            endUtc: endIso,
-            timezone: booking.salesperson.timezone,
-            attendeeEmail: booking.customer.email,
-            body,
-            transactionId: `booking:${booking.id}`
-          });
-        }
-      const result = await prisma.$transaction(async (tx) => {
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${booking.id}))`;
-
-        const latest = await tx.booking.findFirst({ where: { id: booking.id } });
-        if (!latest || latest.status === BookingStatus.confirmed) return latest;
-
-        if (zoomMeeting) {
-          await tx.meeting.upsert({
-            where: { booking_id: booking.id },
-            create: {
-              booking_id: booking.id,
-              provider: "zoom",
-              provider_meeting_id: zoomMeeting.meetingId,
-              join_url: zoomMeeting.joinUrl,
-              start_url: zoomMeeting.startUrl
-            },
-            update: {
-              provider_meeting_id: zoomMeeting.meetingId,
-              join_url: zoomMeeting.joinUrl,
-              start_url: zoomMeeting.startUrl
-            }
-          });
-        }
-
-        if (graphEvent) {
-            await tx.graphEvent.upsert({
-              where: { booking_id: booking.id },
-              create: {
-                booking_id: booking.id,
-                organizer_user_id: booking.salesperson.graph_user_id,
-                event_id: graphEvent.eventId,
-                iCalUId: graphEvent.iCalUId,
-                etag: graphEvent.etag,
-                updated_at: utcNow()
-              },
-              update: {
-                organizer_user_id: booking.salesperson.graph_user_id,
-                event_id: graphEvent.eventId,
-                iCalUId: graphEvent.iCalUId,
-                etag: graphEvent.etag,
-                updated_at: utcNow()
-              }
-            });
+    const initialSlotConflict = await prisma.booking.findFirst({
+      where: {
+        tenant_id: tenant.id,
+        salesperson_id: booking.salesperson_id,
+        start_at_utc: { lt: booking.end_at_utc },
+        end_at_utc: { gt: booking.start_at_utc },
+        NOT: { id: booking.id },
+        OR: [
+          { status: BookingStatus.confirmed },
+          {
+            status: { in: [BookingStatus.hold, BookingStatus.pending_verify] },
+            hold: { is: { expires_at_utc: { gt: nowUtc } } }
           }
-        const updated = await tx.booking.update({
-          where: { id: booking.id },
-          data: {
-            status: BookingStatus.confirmed,
-            verify_token_jti: null
-          }
-        });
-        await this.writePublicConfirmToken(tx, booking.id, null);
-        await tx.hold.deleteMany({ where: { booking_id: booking.id } });
-        return updated;
-      });
-
-      await this.recordIdempotency(tenant.id, "confirm", idempotencyKey);
-
-      const persistedMeeting = await prisma.meeting.findUnique({
-        where: { booking_id: booking.id },
-        select: { join_url: true }
-      });
-      await this.sendConfirmationEmailBestEffort({
-        tenantSlug,
-        tenant,
-        booking,
-        zoomJoinUrl: persistedMeeting?.join_url ?? null
-      });
-
-      return result;
-    } catch (err) {
-      if (zoomMeeting) {
-        const compensationJobId = randomUUID();
-        await prisma.$executeRaw`
-          INSERT INTO "compensation_jobs" (
-            "id",
-            "tenant_id",
-            "booking_id",
-            "status",
-            "reason",
-            "payload",
-            "attempts",
-            "created_at",
-            "updated_at"
-          )
-          VALUES (
-            ${compensationJobId}::uuid,
-            ${tenant.id}::uuid,
-            ${booking.id}::uuid,
-            'pending',
-            'graph_failed_after_zoom',
-            ${JSON.stringify({ zoom_meeting_id: zoomMeeting.meetingId })}::jsonb,
-            0,
-            NOW(),
-            NOW()
-          )
-        `;
-        try {
-          await this.zoom.deleteMeeting(zoomMeeting.meetingId);
-        } catch {
-
-        }
-      }
-      throw err;
+        ]
+      },
+      select: { id: true }
+    });
+    if (initialSlotConflict) {
+      throw new ConflictException("Slot already taken");
     }
+
+    const confirmed = await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${booking.id}))`;
+      const nowInTx = utcNow();
+      const latest = await tx.booking.findFirst({
+        where: { id: booking.id, tenant_id: tenant.id },
+        include: { hold: true }
+      });
+      if (!latest) return null;
+      if (latest.status === BookingStatus.confirmed) return latest;
+      if (latest.status !== BookingStatus.pending_verify) {
+        throw new ConflictException("Invalid booking state");
+      }
+      if (latest.verify_token_jti !== tokenPayload.jti) {
+        throw new ForbiddenException("Token already used");
+      }
+      if (!latest.hold || latest.hold.expires_at_utc <= nowInTx) {
+        log("warn", "confirm_hold_expired", {
+          tenantSlug,
+          requestId,
+          booking_id: latest.id,
+          booking_status: latest.status,
+          hold_expires_at_utc: latest.hold ? toIsoUtc(latest.hold.expires_at_utc) : null,
+          now_utc: toIsoUtc(nowInTx),
+          token_exp: tokenPayload.exp,
+          token_purpose: tokenPayload.purpose,
+          token_booking_id: tokenPayload.booking_id,
+          token_tenant_id: tokenPayload.tenant_id
+        });
+        await tx.booking.update({
+          where: { id: latest.id },
+          data: { status: BookingStatus.expired }
+        });
+        throw new ConflictException("Hold expired");
+      }
+
+      const slotConflict = await tx.booking.findFirst({
+        where: {
+          tenant_id: tenant.id,
+          salesperson_id: latest.salesperson_id,
+          start_at_utc: { lt: latest.end_at_utc },
+          end_at_utc: { gt: latest.start_at_utc },
+          NOT: { id: latest.id },
+          OR: [
+            { status: BookingStatus.confirmed },
+            {
+              status: { in: [BookingStatus.hold, BookingStatus.pending_verify] },
+              hold: { is: { expires_at_utc: { gt: nowInTx } } }
+            }
+          ]
+        },
+        select: { id: true }
+      });
+      if (slotConflict) {
+        throw new ConflictException("Slot already taken");
+      }
+
+      const updated = await tx.booking.update({
+        where: { id: latest.id },
+        data: {
+          status: BookingStatus.confirmed,
+          verify_token_jti: null
+        }
+      });
+      await this.writePublicConfirmToken(tx, latest.id, null);
+      await tx.hold.deleteMany({ where: { booking_id: latest.id } });
+      return updated;
+    });
+
+    if (!confirmed) {
+      return null;
+    }
+    await this.recordIdempotency(tenant.id, "confirm", idempotencyKey);
+    try {
+      await this.runPostConfirmBestEffort(tenantSlug, confirmed.id);
+    } catch (e) {
+      log("warn", "confirm_post_process_failed", {
+        tenantSlug,
+        booking_id: confirmed.id,
+        err: e instanceof Error ? e.message : String(e)
+      });
+    }
+    return confirmed;
   }
 
   async cancelBooking(tenantSlug: string, bookingId: string, token: string, idempotencyKey: string, requestId?: string) {
@@ -1440,6 +1758,11 @@ export class BookingService {
     const tenant = await prisma.tenant.findUnique({ where: { slug: tenantSlug } });
     if (!tenant) throw new NotFoundException("Tenant not found");
     log("info", "cancel_requested", { tenantSlug, bookingId, requestId });
+    log("info", "public_booking_cancel_begin", {
+      tag: "public_booking_cancel_begin",
+      bookingId,
+      requestId: requestId ?? null
+    });
 
     const booking = await prisma.booking.findFirst({
       where: { id: bookingId, tenant_id: tenant.id },
@@ -1448,16 +1771,48 @@ export class BookingService {
     if (!booking) throw new NotFoundException("Booking not found");
 
     const tz = booking.salesperson?.timezone ?? "utc";
+    const cancelDebugEnabled = shouldDebugAvailability({
+      salespersonId: booking.salesperson_id,
+      date: DateTime.fromJSDate(booking.start_at_utc, { zone: "utc" }).setZone(tz).toFormat("yyyy-LL-dd")
+    });
+    if (cancelDebugEnabled) {
+      log("info", "public_booking_cancel_loaded", {
+        tag: "public_booking_cancel_loaded",
+        bookingId: booking.id,
+        statusBefore: booking.status,
+        salespersonId: booking.salesperson_id,
+        startAtUtc: toIsoUtc(booking.start_at_utc),
+        endAtUtc: toIsoUtc(booking.end_at_utc),
+        timezone: tz,
+        requestId: requestId ?? null
+      });
+    }
     if (booking.status === BookingStatus.canceled) {
       await prisma.hold.deleteMany({ where: { booking_id: booking.id } });
-      this.invalidateAvailabilityCacheForStart(tenant.id, booking.salesperson_id, tz, booking.start_at_utc);
+      const invalidatedKeys = this.invalidateAvailabilityCacheForStart(tenant.id, booking.salesperson_id, tz, booking.start_at_utc);
+      if (cancelDebugEnabled) {
+        log("info", "availability_cache_invalidated", {
+          tag: "availability_cache_invalidated",
+          bookingId: booking.id,
+          salespersonId: booking.salesperson_id,
+          invalidatedKeys
+        });
+      }
       return { status: "canceled" };
     }
 
     const existing = await this.checkIdempotency(tenant.id, "cancel", idempotencyKey);
     if (existing) {
       await prisma.hold.deleteMany({ where: { booking_id: booking.id } });
-      this.invalidateAvailabilityCacheForStart(tenant.id, booking.salesperson_id, tz, booking.start_at_utc);
+      const invalidatedKeys = this.invalidateAvailabilityCacheForStart(tenant.id, booking.salesperson_id, tz, booking.start_at_utc);
+      if (cancelDebugEnabled) {
+        log("info", "availability_cache_invalidated", {
+          tag: "availability_cache_invalidated",
+          bookingId: booking.id,
+          salespersonId: booking.salesperson_id,
+          invalidatedKeys
+        });
+      }
       return { status: "canceled" };
     }
 
@@ -1471,8 +1826,18 @@ export class BookingService {
     const deadline = DateTime.fromJSDate(booking.start_at_utc).minus({ hours: CANCEL_DEADLINE_HOURS });
     if (DateTime.utc() > deadline) throw new ConflictException("Cancel deadline passed");
 
-    await prisma.booking.update({ where: { id: booking.id }, data: { status: BookingStatus.canceled } });
+    const canceled = await prisma.booking.update({ where: { id: booking.id }, data: { status: BookingStatus.canceled } });
     await prisma.hold.deleteMany({ where: { booking_id: booking.id } });
+    if (cancelDebugEnabled) {
+      log("info", "public_booking_canceled", {
+        tag: "public_booking_canceled",
+        bookingId: booking.id,
+        statusAfter: canceled.status,
+        salespersonId: booking.salesperson_id,
+        startAtUtc: toIsoUtc(booking.start_at_utc),
+        endAtUtc: toIsoUtc(booking.end_at_utc)
+      });
+    }
 
     try {
       if (booking.graph_event) {
@@ -1503,7 +1868,15 @@ export class BookingService {
       });
     }
     await this.recordIdempotency(tenant.id, "cancel", idempotencyKey);
-    this.invalidateAvailabilityCacheForStart(tenant.id, booking.salesperson_id, tz, booking.start_at_utc);
+    const invalidatedKeys = this.invalidateAvailabilityCacheForStart(tenant.id, booking.salesperson_id, tz, booking.start_at_utc);
+    if (cancelDebugEnabled) {
+      log("info", "availability_cache_invalidated", {
+        tag: "availability_cache_invalidated",
+        bookingId: booking.id,
+        salespersonId: booking.salesperson_id,
+        invalidatedKeys
+      });
+    }
     return { status: "canceled" };
   }
 

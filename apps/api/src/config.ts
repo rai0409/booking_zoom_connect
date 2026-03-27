@@ -1,6 +1,14 @@
+const normalizeBaseUrl = (raw: string, fallback: string): string => {
+  const value = (raw || fallback).trim();
+  return value.replace(/\/+$/, "");
+};
+
 export const config = {
-  baseUrl: process.env.BASE_URL || "http://localhost:3000",
-  apiBaseUrl: process.env.API_BASE_URL || "http://localhost:4000",
+  baseUrl: normalizeBaseUrl(
+    process.env.BASE_URL || process.env.PUBLIC_BASE_URL || process.env.APP_BASE_URL || "",
+    "http://localhost:3000"
+  ),
+  apiBaseUrl: normalizeBaseUrl(process.env.API_BASE_URL || "", "http://localhost:4000"),
   nodeEnv: process.env.NODE_ENV || "development",
   adminApiKey: process.env.ADMIN_API_KEY || "change-me",
   mailDriver: (process.env.MAIL_DRIVER || "graph").toLowerCase(),

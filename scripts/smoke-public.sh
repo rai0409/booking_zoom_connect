@@ -60,6 +60,17 @@ say() {
   printf '%s\n' "$*" >> "$SUMMARY_FILE"
 }
 
+fail_reason() {
+  local code="$1"
+  local detail="${2:-}"
+  if [[ -n "$detail" ]]; then
+    echo "[smoke] ${code}: ${detail}" >&2
+  else
+    echo "[smoke] ${code}" >&2
+  fi
+  exit 1
+}
+
 header_value() {
   local key="$1"
   local hdr="$2"
@@ -105,6 +116,19 @@ expect_2xx() {
   fi
 }
 
+fallback_salesperson_from_db() {
+  if [[ -z "${DATABASE_URL:-}" ]]; then
+    return 1
+  fi
+  local db_url tenant_id sp_id
+  db_url="${DATABASE_URL%%\?schema=*}"
+  tenant_id="$(psql "$db_url" -Atc "select id from tenants where slug='${TENANT_SLUG}' limit 1;" 2>/dev/null || true)"
+  [[ -n "$tenant_id" ]] || return 1
+  sp_id="$(psql "$db_url" -Atc "select id from salespersons where tenant_id='${tenant_id}' order by display_name asc limit 1;" 2>/dev/null || true)"
+  [[ -n "$sp_id" ]] || return 1
+  printf '%s' "$sp_id"
+}
+
 say "artifact_dir=$ARTIFACT_DIR"
 
 say "check /health"
@@ -116,24 +140,36 @@ curl -fsS "$BASE_URL/ready" | jq -e '.ok==true' >/dev/null
 say "check DB"
 psql "$DB_NO_SCHEMA" -c "select 1;" >/dev/null
 
-say "resolve tenant by slug=$TENANT_SLUG"
-TENANT_ID="$(psql "$DB_NO_SCHEMA" -Atc "select id from tenants where slug='${TENANT_SLUG}' limit 1;")"
-[[ -n "$TENANT_ID" ]] || { echo "[smoke] tenant not found for slug=$TENANT_SLUG" >&2; exit 1; }
-
-say "pick salesperson for tenant"
-SP_ID="$(psql "$DB_NO_SCHEMA" -Atc "select id from salespersons where tenant_id='${TENANT_ID}' and active=true order by created_at asc limit 1;")"
-[[ -n "$SP_ID" ]] || { echo "[smoke] active salesperson not found for tenant_id=$TENANT_ID" >&2; exit 1; }
+say "pick salesperson from public API"
+SP_ID=""
+expect_2xx "$(http_call salespersons "$BASE_URL/v1/public/${TENANT_SLUG}/salespersons")" "salespersons"
+if jq -e 'type=="array" and length>0' "$ARTIFACT_DIR/salespersons.res" >/dev/null 2>&1; then
+  SP_ID="$(jq -r '.[0].id' "$ARTIFACT_DIR/salespersons.res")"
+fi
+if [[ "${SP_ID:-}" == "null" ]]; then
+  SP_ID=""
+fi
+if [[ -z "$SP_ID" ]]; then
+  SP_ID="$(fallback_salesperson_from_db || true)"
+fi
+[[ -n "$SP_ID" ]] || fail_reason "SP_ID_EMPTY"
 
 pick_slot() {
-  local d ymd avail
-  for d in {0..7}; do
+  local d ymd
+  for d in {0..14}; do
     ymd="$(date -u -d "+$d days" +%F)"
-    avail="$(curl -fsS "$BASE_URL/v1/public/${TENANT_SLUG}/availability?salesperson=${SP_ID}&date=${ymd}")"
-    printf '%s\n' "$avail" > "$ARTIFACT_DIR/availability_${d}.res"
-    if echo "$avail" | jq -e 'type=="array" and length>0 and .[0].start_at_utc and .[0].end_at_utc' >/dev/null; then
+    expect_2xx "$(http_call "availability_${d}" "$BASE_URL/v1/public/${TENANT_SLUG}/availability?salesperson=${SP_ID}&date=${ymd}")" "availability_${d}"
+    if ! jq -e 'type=="array"' "$ARTIFACT_DIR/availability_${d}.res" >/dev/null 2>&1; then
+      fail_reason "AVAILABILITY_NOT_ARRAY" "date=$ymd"
+    fi
+    if jq -e 'length==0' "$ARTIFACT_DIR/availability_${d}.res" >/dev/null 2>&1; then
+      say "availability_date=$ymd (empty) -> continue"
+      continue
+    fi
+    START_AT="$(jq -r '.[0].start_at_utc // empty' "$ARTIFACT_DIR/availability_${d}.res")"
+    END_AT="$(jq -r '.[0].end_at_utc // empty' "$ARTIFACT_DIR/availability_${d}.res")"
+    if [[ -n "$START_AT" && -n "$END_AT" ]]; then
       cp "$ARTIFACT_DIR/availability_${d}.res" "$ARTIFACT_DIR/availability.res"
-      START_AT="$(echo "$avail" | jq -r '.[0].start_at_utc')"
-      END_AT="$(echo "$avail" | jq -r '.[0].end_at_utc')"
       say "availability_date=$ymd"
       say "slot: $START_AT -> $END_AT"
       return 0
@@ -142,8 +178,8 @@ pick_slot() {
   return 1
 }
 
-say "GET availability (find first slot in next 7 days)"
-pick_slot || { echo "[smoke] no availability in next 7 days for salesperson=$SP_ID" >&2; exit 1; }
+say "GET availability (find first slot in next 14 days)"
+pick_slot || fail_reason "NO_SLOT_FOUND" "salesperson=$SP_ID"
 
 IDEMP="$(uuid)"
 EMAIL="smoke+$(date +%s)@example.com"
@@ -164,7 +200,7 @@ expect_2xx "$(http_call hold -X POST "$BASE_URL/v1/public/${TENANT_SLUG}/holds" 
   --data-binary "@$ARTIFACT_DIR/hold_payload.json")" "hold"
 
 BOOKING_ID="$(jq -r '.id // empty' "$ARTIFACT_DIR/hold.res")"
-[[ -n "$BOOKING_ID" ]] || { echo "[smoke] hold response missing id" >&2; cat "$ARTIFACT_DIR/hold.res" >&2; exit 1; }
+[[ -n "$BOOKING_ID" ]] || fail_reason "BOOKING_ID_EMPTY"
 
 IDEMP="$(uuid)"
 say "POST verify-email"
@@ -174,7 +210,7 @@ expect_2xx "$(http_call verify -X POST "$BASE_URL/v1/public/${TENANT_SLUG}/auth/
   -d "$(jq -n --arg id "$BOOKING_ID" '{booking_id:$id}')")" "verify"
 
 TOKEN="$(jq -r '.token // empty' "$ARTIFACT_DIR/verify.res")"
-[[ -n "$TOKEN" ]] || { echo "[smoke] verify-email missing token" >&2; cat "$ARTIFACT_DIR/verify.res" >&2; exit 1; }
+[[ -n "$TOKEN" ]] || fail_reason "VERIFY_TOKEN_EMPTY"
 
 IDEMP="$(uuid)"
 say "POST confirm"
@@ -212,7 +248,7 @@ BOOKING1_STATUS="$(psql "$DB_NO_SCHEMA" -Atc "select status from bookings where 
 [[ "$BOOKING1_STATUS" == "canceled" ]] || { echo "[smoke] booking1 DB status expected canceled but got: $BOOKING1_STATUS" >&2; exit 1; }
 
 say "GET availability for booking2"
-pick_slot || { echo "[smoke] no availability for booking2 in next 7 days for salesperson=$SP_ID" >&2; exit 1; }
+pick_slot || fail_reason "NO_SLOT_FOUND" "booking2 salesperson=$SP_ID"
 
 IDEMP="$(uuid)"
 EMAIL2="smoke2+$(date +%s)@example.com"
@@ -233,7 +269,7 @@ expect_2xx "$(http_call hold2 -X POST "$BASE_URL/v1/public/${TENANT_SLUG}/holds"
   --data-binary "@$ARTIFACT_DIR/hold2_payload.json")" "hold2"
 
 BOOKING2_ID="$(jq -r '.id // empty' "$ARTIFACT_DIR/hold2.res")"
-[[ -n "$BOOKING2_ID" ]] || { echo "[smoke] hold2 response missing id" >&2; cat "$ARTIFACT_DIR/hold2.res" >&2; exit 1; }
+[[ -n "$BOOKING2_ID" ]] || fail_reason "BOOKING_ID_EMPTY"
 OLD2_START="$(jq -r '.start_at_utc // empty' "$ARTIFACT_DIR/hold2.res")"
 OLD2_END="$(jq -r '.end_at_utc // empty' "$ARTIFACT_DIR/hold2.res")"
 [[ -n "$OLD2_START" && -n "$OLD2_END" ]] || { echo "[smoke] hold2 missing start/end" >&2; exit 1; }
@@ -246,7 +282,7 @@ expect_2xx "$(http_call verify2 -X POST "$BASE_URL/v1/public/${TENANT_SLUG}/auth
   -d "$(jq -n --arg id "$BOOKING2_ID" '{booking_id:$id}')")" "verify2"
 
 TOKEN2="$(jq -r '.token // empty' "$ARTIFACT_DIR/verify2.res")"
-[[ -n "$TOKEN2" ]] || { echo "[smoke] verify-email2 missing token" >&2; cat "$ARTIFACT_DIR/verify2.res" >&2; exit 1; }
+[[ -n "$TOKEN2" ]] || fail_reason "VERIFY_TOKEN_EMPTY"
 
 IDEMP="$(uuid)"
 say "POST confirm (booking2)"

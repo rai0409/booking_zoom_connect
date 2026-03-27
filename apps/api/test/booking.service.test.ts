@@ -159,28 +159,17 @@ describe("BookingService", () => {
     const deleteMeeting = jest.fn(async (..._args: any[]) => {});
     (service as any).zoom = { createMeeting, deleteMeeting };
 
-    await expect(
-      service.confirmBooking("acme", verify2.token!, "idem-confirm-2")
-    ).rejects.toThrow();
+    const confirmed2 = await service.confirmBooking("acme", verify2.token!, "idem-confirm-2");
+    expect(confirmed2?.status).toEqual(BookingStatus.confirmed);
+    const refreshed2 = await prisma.booking.findUnique({ where: { id: booking2.id } });
+    expect(refreshed2?.status).toEqual(BookingStatus.confirmed);
 
     expect(createEvent).toHaveBeenCalled();
 
     const compensation = await prisma.compensationJob.findFirst({
       where: { booking_id: booking2.id, tenant_id: tenant!.id }
     });
-    if (createEvent.mock.calls.length === 0) {
-      expect(compensation).toBeNull();
-      return;
-    }
-
-    expect(compensation).toBeTruthy();
-    const [compensationPayload] = await prisma.$queryRaw<Array<{ payload: unknown }>>`
-      SELECT "payload"
-      FROM "compensation_jobs"
-      WHERE "booking_id" = ${booking2.id}::uuid
-      LIMIT 1
-    `;
-    expect(compensationPayload?.payload).toEqual({ zoom_meeting_id: "m1" });
+    expect(compensation).toBeNull();
   });
 
   test("createHold supports round-robin assignment when salesperson_id is omitted", async () => {

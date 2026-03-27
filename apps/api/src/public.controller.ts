@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Get, Headers, Inject, Param, Post, Query, Req } from "@nestjs/common";
+import { BadRequestException, Body, Controller, Get, Headers, HttpException, Inject, Param, Post, Query, Req } from "@nestjs/common";
 import type { Request } from "express";
 import { BookingService } from "./services/booking.service";
 import { AvailabilityQueryDto } from "./dto/public/availability.query.dto";
@@ -21,6 +21,32 @@ type PublicConfirmResponse = {
 @Controller("/v1/public")
 export class PublicController {
   constructor(@Inject(BookingService) private readonly bookingService: BookingService) {}
+
+  private extractExceptionMessage(error: HttpException): string {
+    const response = error.getResponse();
+    if (typeof response === "string") return response;
+    if (typeof response === "object" && response !== null) {
+      const message = (response as { message?: unknown }).message;
+      if (Array.isArray(message)) return String(message[0] ?? error.message);
+      if (typeof message === "string") return message;
+    }
+    return error.message;
+  }
+
+  private classifyConfirmErrorCode(status: number, message: string): "HOLD_EXPIRED" | "INVALID_TOKEN" | "INTERNAL_ERROR" {
+    const normalized = message.toLowerCase();
+    if (normalized.includes("hold expired")) return "HOLD_EXPIRED";
+    if (
+      status === 401 ||
+      status === 403 ||
+      normalized.includes("token") ||
+      normalized.includes("invalid token") ||
+      normalized.includes("token required")
+    ) {
+      return "INVALID_TOKEN";
+    }
+    return "INTERNAL_ERROR";
+  }
 
   @Get(":tenantSlug/availability")
   async availability(
@@ -74,7 +100,25 @@ export class PublicController {
     if (body.booking_id !== undefined) {
       throw new BadRequestException("token required (booking_id confirm is not supported)");
     }
-    return this.bookingService.confirmBookingPublic(tenantSlug, body.token, idempotencyKey, requestId);
+    try {
+      return await this.bookingService.confirmBookingPublic(tenantSlug, body.token, idempotencyKey, requestId);
+    } catch (error) {
+      if (error instanceof HttpException) {
+        const message = this.extractExceptionMessage(error);
+        const status = error.getStatus();
+        const code = this.classifyConfirmErrorCode(status, message);
+        log("warn", "public_confirm_failed", { tenantSlug, requestId, status, message, code });
+        throw new HttpException({ message, code }, status);
+      }
+      log("error", "public_confirm_failed", {
+        tenantSlug,
+        requestId,
+        status: 500,
+        message: error instanceof Error ? error.message : String(error),
+        code: "INTERNAL_ERROR"
+      });
+      throw new HttpException({ message: "Internal server error", code: "INTERNAL_ERROR" }, 500);
+    }
   }
 
   @Post(":tenantSlug/confirm-by-id")
