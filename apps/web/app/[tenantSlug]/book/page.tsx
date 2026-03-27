@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
+import { DateTime } from "luxon";
 
 type Slot = { start_at_utc: string; end_at_utc: string };
 
@@ -17,7 +18,8 @@ type ErrorResponse = { message?: string };
 export default function BookingPage({ params }: { params: { tenantSlug: string } }) {
   const searchParams = useSearchParams();
   const salespersonId = searchParams.get("salesperson") || "";
-  const date = searchParams.get("date") || new Date().toISOString().slice(0, 10);
+  const todayJst = DateTime.now().setZone("Asia/Tokyo").toFormat("yyyy-LL-dd");
+  const date = searchParams.get("date") || todayJst;
   const storageKey = useMemo(() => `public-booking:${params.tenantSlug}:booking_id`, [params.tenantSlug]);
 
   const [slots, setSlots] = useState<Slot[]>([]);
@@ -200,8 +202,16 @@ export default function BookingPage({ params }: { params: { tenantSlug: string }
                 onClick={() => setSelectedSlot(slot)}
                 type="button"
               >
-                <div>{new Date(slot.start_at_utc).toLocaleString()}</div>
-                <div className="text-xs text-gray-600">{slot.end_at_utc}</div>
+                <div>
+                  {DateTime.fromISO(slot.start_at_utc, { zone: "utc" })
+                    .setZone("Asia/Tokyo")
+                    .toFormat("yyyy-LL-dd HH:mm")}
+                </div>
+                <div className="text-xs text-gray-600">
+                  {DateTime.fromISO(slot.end_at_utc, { zone: "utc" })
+                    .setZone("Asia/Tokyo")
+                    .toFormat("HH:mm")}
+                </div>
               </button>
             );
           })}

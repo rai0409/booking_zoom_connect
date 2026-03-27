@@ -69,6 +69,7 @@ on_error() {
   echo "- smoke fail at cancel_url/reschedule_url -> backend contract mismatch"
   echo "- smoke fail at reschedule POST -> page/proxy/body shape mismatch"
   echo "- invalid/expired/missing booking_id -> safe-stop 分岐を確認"
+  echo "- explicit smoke reason codes -> SP_ID_EMPTY / AVAILABILITY_NOT_ARRAY / NO_SLOT_FOUND / BOOKING_ID_EMPTY / VERIFY_TOKEN_EMPTY"
   echo "- EADDRINUSE -> 3000/4000 の既存プロセスを停止"
   echo
   exit "$exit_code"

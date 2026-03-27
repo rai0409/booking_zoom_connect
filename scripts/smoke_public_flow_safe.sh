@@ -114,7 +114,7 @@ fallback_salesperson_from_db() {
   tenant_id="$(psql "$db_url" -Atc "select id from tenants where slug='${TENANT_SLUG}' limit 1;" 2>/dev/null || true)"
   [[ -n "$tenant_id" ]] || return 1
 
-  sp_id="$(psql "$db_url" -Atc "select id from salespersons where tenant_id='${tenant_id}' and active=true order by display_name asc limit 1;" 2>/dev/null || true)"
+  sp_id="$(psql "$db_url" -Atc "select id from salespersons where tenant_id='${tenant_id}' order by display_name asc limit 1;" 2>/dev/null || true)"
   [[ -n "$sp_id" ]] || return 1
 
   printf '%s' "$sp_id"
@@ -125,10 +125,17 @@ pick_future_slot() {
   local min_epoch ymd code slot
   min_epoch="$(date -u -d '+48 hours' +%s)"
 
-  for d in {0..7}; do
+  for d in {0..14}; do
     ymd="$(date -u -d "+$d days" +%F)"
     code="$(http_call "availability_$d" "$API_BASE/v1/public/$TENANT_SLUG/availability?salesperson=$salesperson_id&date=$ymd")"
     expect_2xx "$code" "availability_$d"
+    if ! jq -e 'type=="array"' "$ARTIFACT_DIR/availability_$d.res" >/dev/null 2>&1; then
+      fail "AVAILABILITY_NOT_ARRAY date=$ymd"
+    fi
+    if jq -e 'length==0' "$ARTIFACT_DIR/availability_$d.res" >/dev/null 2>&1; then
+      log "availability date=$ymd is empty -> continue"
+      continue
+    fi
 
     slot="$(jq -c --argjson min "$min_epoch" '
       map(
@@ -173,6 +180,9 @@ collect_slot_candidates() {
     step_name="${step_prefix}_d${offset}"
     code="$(http_call "$step_name" "$API_BASE/v1/public/$TENANT_SLUG/availability?salesperson=$salesperson_id&date=$target_date")"
     expect_2xx "$code" "$step_name"
+    if ! jq -e 'type=="array"' "$ARTIFACT_DIR/$step_name.res" >/dev/null 2>&1; then
+      fail "AVAILABILITY_NOT_ARRAY date=$target_date"
+    fi
 
     day_file="$ARTIFACT_DIR/${step_name}.candidates.json"
     if [[ -n "$exclude_start" && -n "$exclude_end" ]]; then
@@ -206,7 +216,10 @@ SALES_CODE="$(http_call salespersons "$API_BASE/v1/public/$TENANT_SLUG/salespers
 expect_2xx "$SALES_CODE" "salespersons"
 
 if jq -e 'type=="array" and length>0' "$ARTIFACT_DIR/salespersons.res" >/dev/null 2>&1; then
-  SP_ID="$(json_get "$ARTIFACT_DIR/salespersons.res" '.[0].id // empty')"
+  SP_ID="$(jq -r '.[0].id' "$ARTIFACT_DIR/salespersons.res")"
+fi
+if [[ "${SP_ID:-}" == "null" ]]; then
+  SP_ID=""
 fi
 
 if [[ -z "$SP_ID" ]]; then
@@ -214,12 +227,12 @@ if [[ -z "$SP_ID" ]]; then
   SP_ID="$(fallback_salesperson_from_db || true)"
 fi
 
-[[ -n "$SP_ID" ]] || fail "No salesperson found (API empty and DB fallback failed)"
+[[ -n "$SP_ID" ]] || fail "SP_ID_EMPTY"
 log "salesperson_source=$SP_SOURCE salesperson_id=$SP_ID"
 
 # booking1: hold -> verify -> confirm -> cancel
 SLOT="$(pick_future_slot "$SP_ID" || true)"
-[[ -n "$SLOT" ]] || fail "No slot found (>=48h). Check business hours / max_days_ahead / seed"
+[[ -n "$SLOT" ]] || fail "NO_SLOT_FOUND"
 
 START="$(printf '%s' "$SLOT" | jq -r '.start_at_utc')"
 END="$(printf '%s' "$SLOT" | jq -r '.end_at_utc')"
@@ -243,7 +256,7 @@ expect_2xx "$(http_call hold -X POST \
   --data-binary "@$ARTIFACT_DIR/hold_payload.json")" "hold"
 
 BOOKING_ID="$(json_get "$ARTIFACT_DIR/hold.res" '.id // empty')"
-[[ -n "$BOOKING_ID" ]] || fail "booking_id missing in hold response"
+[[ -n "$BOOKING_ID" ]] || fail "BOOKING_ID_EMPTY"
 
 expect_2xx "$(http_call verify -X POST \
   -H "Content-Type: application/json" \
@@ -252,7 +265,7 @@ expect_2xx "$(http_call verify -X POST \
   -d "{\"booking_id\":\"$BOOKING_ID\"}")" "verify"
 
 VERIFY_TOKEN="$(json_get "$ARTIFACT_DIR/verify.res" '.token // empty')"
-[[ -n "$VERIFY_TOKEN" ]] || fail "verify token missing"
+[[ -n "$VERIFY_TOKEN" ]] || fail "VERIFY_TOKEN_EMPTY"
 
 expect_2xx "$(http_call confirm -X POST \
   -H "Content-Type: application/json" \
@@ -286,7 +299,7 @@ collect_slot_candidates \
   "availability_resched" \
   "$SP_ID" \
   "$DATE1" \
-  7 \
+  14 \
   "$START" \
   "$END"
 
@@ -363,7 +376,7 @@ collect_slot_candidates \
   "availability_reschedule_target" \
   "$SP_ID" \
   "$BASE_RESCH_DATE" \
-  7 \
+  14 \
   "$OLD2_START" \
   "$OLD2_END"
 

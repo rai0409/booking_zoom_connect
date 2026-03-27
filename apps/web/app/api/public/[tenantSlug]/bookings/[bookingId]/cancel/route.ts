@@ -4,7 +4,7 @@ type RouteContext = { params: Promise<{ tenantSlug: string; bookingId: string }>
 
 export async function POST(req: Request, context: RouteContext) {
   const params = await context.params;
-  const base = process.env.NEXT_PUBLIC_API_BASE ?? process.env.API_BASE_URL ?? "http://localhost:4000";
+  const base = process.env.API_BASE_URL ?? "http://127.0.0.1:4000";
   const idem = req.headers.get("idempotency-key") ?? req.headers.get("Idempotency-Key");
   const payload = await req.json();
   const token = payload?.token;

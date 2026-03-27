@@ -29,6 +29,12 @@ export function verifyBookingToken(token: string): BookingTokenPayload {
   return decoded;
 }
 
+export function decodeBookingTokenUnsafe(token: string): Partial<BookingTokenPayload> | null {
+  const decoded = jwt.decode(token);
+  if (!decoded || typeof decoded !== "object") return null;
+  return decoded as Partial<BookingTokenPayload>;
+}
+
 function getJwtSecret(): string {
   return process.env.JWT_SECRET || "dev-secret";
 }
