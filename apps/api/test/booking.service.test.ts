@@ -172,6 +172,69 @@ describe("BookingService", () => {
     expect(compensation).toBeNull();
   });
 
+  test("confirm response and confirmation email include path-based cancel/reschedule links", async () => {
+    const tenant = await prisma.tenant.findUnique({ where: { slug: "acme" } });
+    const salesperson = await prisma.salesperson.findFirst({ where: { tenant_id: tenant!.id } });
+    expect(tenant).toBeTruthy();
+    expect(salesperson).toBeTruthy();
+
+    process.env.GRAPH_ENABLED = "0";
+    const booking = await service.createHold(
+      "acme",
+      {
+        salesperson_id: salesperson!.id,
+        start_at: DateTime.utc().plus({ hours: 9 }).toISO()!,
+        end_at: DateTime.utc().plus({ hours: 10 }).toISO()!,
+        customer: { email: "links@example.com" }
+      },
+      "idem-links-hold"
+    );
+
+    const verify = await service.sendVerification("acme", booking.id, "idem-links-verify");
+    await prisma.tenant.update({
+      where: { id: tenant!.id },
+      data: {
+        m365_tenant_id: tenant!.m365_tenant_id ?? "mock-m365-tenant",
+        public_booking_enabled: true
+      }
+    });
+    process.env.GRAPH_ENABLED = "1";
+
+    const sendMail = jest.fn(async (..._args: any[]) => {});
+    (service as any).mailSender = { send: sendMail };
+
+    const confirmed = await service.confirmBookingPublic("acme", verify.token!, "idem-links-confirm");
+    expect(confirmed.status).toEqual("confirmed");
+    expect(confirmed.booking_id).toEqual(booking.id);
+
+    const cancelUrl = new URL(confirmed.cancel_url);
+    expect(cancelUrl.pathname).toEqual("/public/acme/cancel");
+    expect(cancelUrl.searchParams.get("booking_id")).toEqual(booking.id);
+    expect(cancelUrl.searchParams.get("token")).toBeTruthy();
+
+    const rescheduleUrl = new URL(confirmed.reschedule_url);
+    expect(rescheduleUrl.pathname).toEqual("/public/acme/reschedule");
+    expect(rescheduleUrl.searchParams.get("booking_id")).toEqual(booking.id);
+    expect(rescheduleUrl.searchParams.get("token")).toBeTruthy();
+
+    expect(sendMail).toHaveBeenCalledTimes(1);
+    const emailBody = String(sendMail.mock.calls[0]?.[0]?.body ?? "");
+    const emailCancelLine = emailBody.split("\n").find((line) => line.startsWith("Cancel: "));
+    const emailRescheduleLine = emailBody.split("\n").find((line) => line.startsWith("Reschedule: "));
+    expect(emailCancelLine).toBeTruthy();
+    expect(emailRescheduleLine).toBeTruthy();
+
+    const emailCancelUrl = new URL(emailCancelLine!.slice("Cancel: ".length).trim());
+    expect(emailCancelUrl.pathname).toEqual("/public/acme/cancel");
+    expect(emailCancelUrl.searchParams.get("booking_id")).toEqual(booking.id);
+    expect(emailCancelUrl.searchParams.get("token")).toBeTruthy();
+
+    const emailRescheduleUrl = new URL(emailRescheduleLine!.slice("Reschedule: ".length).trim());
+    expect(emailRescheduleUrl.pathname).toEqual("/public/acme/reschedule");
+    expect(emailRescheduleUrl.searchParams.get("booking_id")).toEqual(booking.id);
+    expect(emailRescheduleUrl.searchParams.get("token")).toBeTruthy();
+  });
+
   test("createHold supports round-robin assignment when salesperson_id is omitted", async () => {
     const tenant = await prisma.tenant.findUnique({ where: { slug: "acme" } });
     expect(tenant).toBeTruthy();

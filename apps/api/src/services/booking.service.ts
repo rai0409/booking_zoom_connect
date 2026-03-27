@@ -98,6 +98,26 @@ export class BookingService {
     return DateTime.fromJSDate(nowUtc, { zone: "utc" }).plus({ minutes: this.holdTtlMinutes }).toUTC().toJSDate();
   }
 
+  private buildCancelUrl(tenantSlug: string, bookingId: string, token: string): string {
+    const url = new URL(
+      `/public/${encodeURIComponent(tenantSlug)}/cancel`,
+      `${config.baseUrl.replace(/\/$/, "")}/`
+    );
+    url.searchParams.set("booking_id", bookingId);
+    url.searchParams.set("token", token);
+    return url.toString();
+  }
+
+  private buildRescheduleUrl(tenantSlug: string, bookingId: string, token: string): string {
+    const url = new URL(
+      `/public/${encodeURIComponent(tenantSlug)}/reschedule`,
+      `${config.baseUrl.replace(/\/$/, "")}/`
+    );
+    url.searchParams.set("booking_id", bookingId);
+    url.searchParams.set("token", token);
+    return url.toString();
+  }
+
   private buildPublicBookingUrl(tenantSlug: string, params: Record<string, string>): string {
     const url = new URL(`/public/${tenantSlug}`, `${config.baseUrl.replace(/\/$/, "")}/`);
     Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
@@ -162,16 +182,8 @@ export class BookingService {
     const cancelToken = this.issueToken(bookingId, tenantId, "cancel", exp, `cancel-${bookingId}-${now}`);
     const rescheduleToken = this.issueToken(bookingId, tenantId, "reschedule", exp, `reschedule-${bookingId}-${now}`);
     return {
-      cancelUrl: this.buildPublicBookingUrl(tenantSlug, {
-        action: "cancel",
-        booking_id: bookingId,
-        token: cancelToken
-      }),
-      rescheduleUrl: this.buildPublicBookingUrl(tenantSlug, {
-        action: "reschedule",
-        booking_id: bookingId,
-        token: rescheduleToken
-      })
+      cancelUrl: this.buildCancelUrl(tenantSlug, bookingId, cancelToken),
+      rescheduleUrl: this.buildRescheduleUrl(tenantSlug, bookingId, rescheduleToken)
     };
   }
 
