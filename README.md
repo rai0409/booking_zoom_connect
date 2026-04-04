@@ -1,165 +1,52 @@
 # Booking Zoom Connect
 
-Monorepo for a multi-tenant scheduling MVP (NestJS + Next.js + Postgres).
+Multi-tenant scheduling MVP with explicit workflow states, external integrations, and operations-aware backend design.
 
-Local defaults:
-- API: http://localhost:4000
-- Web: http://localhost:3000
+This project is built for scheduling workflows where confirmation, cancellation, rescheduling, and third-party integrations must remain reliable under real operational constraints.
 
-## Local run
+## What it does
 
-1) Start database
+- Provides public booking availability and hold flows
+- Supports verification, confirmation, cancellation, and rescheduling
+- Models booking transitions explicitly as workflow states
+- Prepares the system for Graph, Zoom, and queue-based integrations
+- Separates public booking flows from internal debugging and ops endpoints
+
+## Typical use cases
+
+- Scheduling and appointment booking
+- Multi-tenant booking backends
+- Integration-heavy workflow systems
+- Small SaaS products with operational constraints
+- Booking systems that need recoverable state transitions
+
+## Stack
+
+TypeScript, NestJS, Next.js, Prisma, PostgreSQL, Docker Compose, pnpm, Turborepo
+
+## Why this repo matters
+
+Scheduling looks simple until workflows need reliable transitions, retries, idempotency, and external API integration. This repository shows how to design booking flows with operational reliability in mind.
+
+## Quick start
 
 ```bash
 docker compose up -d
-```
-
-2) Install dependencies
-
-```bash
 pnpm -w install
-```
-
-3) Create schema and seed
-
-```bash
 pnpm -w db:migrate
 pnpm -w db:seed
-```
-
-4) Run apps
-
-```bash
 pnpm -w dev
 ```
 
-If you run apps separately (example):
+## Local defaults
 
-```bash
-# API
-pnpm -C apps/api dev
+- API: http://localhost:4000
+- Web: http://localhost:3000
 
-# Web
-pnpm -C apps/web dev
-```
+## Notes
 
-## Environment variables
-
-Copy `.env.example` to `.env` and fill values.
-
-```bash
-cp .env.example .env
-```
-### Required for local core (DB + public booking flow)
-
-- `DATABASE_URL`
-- `JWT_SECRET`
-- `ADMIN_API_KEY`
-- `BASE_URL=http://localhost:3000` (token issuer / links)
-- `NEXT_PUBLIC_API_BASE=http://localhost:4000` (web app -> API)
-- `API_BASE_URL=http://localhost:4000` (scripts/jobs -> API)
-
-### Optional (integrations)
-
-Microsoft Graph / Zoom are only required when you actually enable those paths.
-
-- Graph (if enabled):
-  - `MS_CLIENT_ID`, `MS_CLIENT_SECRET` (and tenant/app settings)
-  - Local mock: `GRAPH_MOCK=true`
-- Zoom (if enabled):
-  - `ZOOM_ACCOUNT_ID`, `ZOOM_CLIENT_ID`, `ZOOM_CLIENT_SECRET`
-  - Local mock: `ZOOM_MOCK=true`
-
-Queue:
-- `QUEUE_DRIVER=memory` (dev only)
-- `QUEUE_DRIVER=servicebus` (recommended for prod)
-- `SERVICEBUS_CONNECTION` and `SERVICEBUS_QUEUE_NAME` when using `QUEUE_DRIVER=servicebus`
-
-## Seeding
-
-Seed script creates a default tenant and 1–2 salespersons.
-
-```bash
-pnpm -C apps/api db:seed
-```
-
-## Public booking API (core endpoints)
-
-- `GET /v1/public/:tenantSlug/availability?date=YYYY-MM-DD`
-- `POST /v1/public/:tenantSlug/holds`
-- `POST /v1/public/:tenantSlug/auth/verify-email`
-- `POST /v1/public/:tenantSlug/confirm` (token only)
-- `POST /v1/public/:tenantSlug/bookings/:bookingId/cancel`
-- `POST /v1/public/:tenantSlug/bookings/:bookingId/reschedule`
-
-## Internal admin API (for debugging/ops)
-
-All internal endpoints require:
-
-- Header: `x-admin-api-key: ${ADMIN_API_KEY}`
-
-Endpoints:
-- `GET /v1/internal/:tenantSlug/bookings?from&to&limit`
-- `GET /v1/internal/:tenantSlug/bookings/:bookingId/links`
-  Regenerates cancel/reschedule links for an already confirmed booking (useful when tokens are lost).
-
-## Smoke test (public flow)
-
-This script runs:
-- create booking1 -> confirm -> regenerate links -> cancel
-- create booking2 -> confirm -> regenerate links -> reschedule
-
-Run:
-
-```bash
-# For dev/smoke token extraction, start the API with PUBLIC_RETURN_VERIFY_TOKEN=1
-sed -i 's/\r$//' scripts/smoke_public_flow_safe.sh
-chmod +x scripts/smoke_public_flow_safe.sh
-bash scripts/smoke_public_flow_safe.sh
-```
-
-Env (optional overrides):
-- `TENANT_SLUG` (default: `acme`)
-- `API_BASE` (default: `http://localhost:4000`)
-- `ENV_FILE` (default: repo root `./.env`)
-
-Expected output:
-- `booking1(canceled)=...`
-- `booking2(rescheduled)=...`
-
-## Booking state machine
-
-| State | Allowed transitions |
-| --- | --- |
-| hold | pending_verify, expired |
-| pending_verify | confirmed, expired |
-| confirmed | canceled, hold (reschedule) |
-| canceled | — |
-| expired | — |
-
-## Entra ID (multi-tenant)
-
-- Planned / 未実装: `GET /v1/tenants/connect` and `GET /v1/tenants/callback` are not provided in this snapshot.
-- For manual OAuth experiments, use `scripts/ms_auth_url.sh` and `scripts/ms_oauth_poc.sh`.
-- Required Microsoft Graph permissions (high-level): `Calendars.ReadWrite`, `MailboxSettings.Read`, `User.Read`, `offline_access`
-
-## Zoom (Server-to-Server OAuth)
-
-- Create a Zoom Server-to-Server OAuth app
-- Store `ZOOM_ACCOUNT_ID`, `ZOOM_CLIENT_ID`, `ZOOM_CLIENT_SECRET` as env vars
-- The API uses these credentials to create and delete meetings
-
-## Azure Container Apps (outline)
-
-1) Build and push image
-2) Create Container App with env vars
-3) Set min replicas to 1 for webhook responsiveness
-
-Example:
-
-```bash
-az containerapp update \
-  --name booking-api \
-  --resource-group <rg> \
-  --min-replicas 1
-```
+This repository is a good fit for teams that need:
+- workflow-driven booking systems
+- integration-ready backend design
+- multi-tenant scheduling products
+- operationally reliable state handling
