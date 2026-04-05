@@ -1,0 +1,11 @@
+HTTP/1.1 200 OK
+X-Powered-By: Express
+x-request-id: 36117579-6caa-45cb-85b3-5e8e39131f97
+Content-Type: application/json; charset=utf-8
+Content-Length: 587
+ETag: W/"24b-LLIIt8tEEBPwz+Cb+lLSfqZ5OUU"
+Date: Sun, 05 Apr 2026 15:16:07 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5
+
+{"ok":true,"ts":"2026-04-05T15:16:07.073Z","checks":{"env:DATABASE_URL":{"ok":true},"env:JWT_SECRET":{"ok":true},"env:ADMIN_API_KEY":{"ok":true},"env:MS_CLIENT_ID":{"ok":true},"env:MS_CLIENT_SECRET":{"ok":true},"env:MS_SHARED_MAILBOX":{"ok":true},"env:servicebus_required_skipped":{"ok":true,"detail":"QUEUE_DRIVER=memory"},"db:connect":{"ok":true},"db:table:tenants":{"ok":true},"db:table:bookings":{"ok":true},"db:table:holds":{"ok":true},"db:column:bookings.status":{"ok":true},"db:column:holds.expires_at_utc":{"ok":true},"db:column:bookings.customer_reinvite_required":{"ok":true}}}
