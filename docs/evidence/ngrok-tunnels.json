@@ -1,0 +1,39 @@
+{
+  "tunnels": [
+    {
+      "name": "command_line",
+      "ID": "76c30c79fcac59f39ff57dc1711535fc",
+      "uri": "/api/tunnels/command_line",
+      "public_url": "https://chastenedly-radiophonic-gwenda.ngrok-free.dev",
+      "proto": "https",
+      "config": {
+        "addr": "http://localhost:3000",
+        "inspect": true
+      },
+      "metrics": {
+        "conns": {
+          "count": 26,
+          "gauge": 0,
+          "rate1": 4.0438328822124125E-9,
+          "rate5": 0.001725741774432199,
+          "rate15": 0.0073897038105916225,
+          "p50": 6502375326.5,
+          "p90": 30890710328.000015,
+          "p95": 459988495028.4991,
+          "p99": 681860586039
+        },
+        "http": {
+          "count": 31,
+          "rate1": 3.860116047555519E-9,
+          "rate5": 0.001868540348095549,
+          "rate15": 0.008416058788031302,
+          "p50": 49227409,
+          "p90": 6721101170.8,
+          "p95": 14147131772.59999,
+          "p99": 17581491530
+        }
+      }
+    }
+  ],
+  "uri": "/api/tunnels"
+}
