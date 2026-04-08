@@ -1,52 +1,75 @@
-# Booking Zoom Connect
+# Workflow-Driven Scheduling Backend with External Integrations
 
-Multi-tenant scheduling MVP with explicit workflow states, external integrations, and operations-aware backend design.
+A multi-tenant scheduling backend designed for real operational flows:
+availability, hold, verify, confirm, cancel, and reschedule.
 
-This project is built for scheduling workflows where confirmation, cancellation, rescheduling, and third-party integrations must remain reliable under real operational constraints.
+## What this solves
+
+Manual scheduling often breaks under real business constraints such as double booking, confirmation flow complexity, and external calendar integration.
+
+This repository focuses on workflow-safe booking flows that can support production-oriented internal or public scheduling systems.
+
+## Core flow
+
+availability -> hold -> verify -> confirm / cancel / reschedule
+
+## Demo
+
+![Booking flow demo](docs/images/booking_flow.png)
 
 ## What it does
 
-- Provides public booking availability and hold flows
-- Supports verification, confirmation, cancellation, and rescheduling
-- Models booking transitions explicitly as workflow states
-- Prepares the system for Graph, Zoom, and queue-based integrations
-- Separates public booking flows from internal debugging and ops endpoints
+- provides multi-tenant booking flows
+- manages holds and confirmation steps
+- supports cancellation and rescheduling workflows
+- integrates with external systems
+- keeps workflow states explicit and implementation-friendly
 
-## Typical use cases
+## Quick start
 
-- Scheduling and appointment booking
-- Multi-tenant booking backends
-- Integration-heavy workflow systems
-- Small SaaS products with operational constraints
-- Booking systems that need recoverable state transitions
+```bash
+pnpm install
+pnpm dev
+```
+
+## Repository layout
+
+```text
+.
+├── apps/
+├── docs/
+├── packages/
+│   └── shared/
+├── prompts/
+├── scripts/
+│   └── repo_tools/
+├── .env.example
+├── .gitignore
+├── .pre-commit-config.yaml
+├── LICENSE
+├── README.md
+├── docker-compose.yml
+├── package.json
+├── pnpm-lock.yaml
+├── pnpm-workspace.yaml
+└── turbo.json
+```
+
+## Notes
+
+This repository is a good fit for teams that need:
+
+- workflow-driven booking systems
+- integration-ready backend design
+- multi-tenant scheduling products
+- operationally reliable state handling
 
 ## Stack
 
 TypeScript, NestJS, Next.js, Prisma, PostgreSQL, Docker Compose, pnpm, Turborepo
 
-## Why this repo matters
+## License
 
-Scheduling looks simple until workflows need reliable transitions, retries, idempotency, and external API integration. This repository shows how to design booking flows with operational reliability in mind.
-
-## Quick start
-
-```bash
-docker compose up -d
-pnpm -w install
-pnpm -w db:migrate
-pnpm -w db:seed
-pnpm -w dev
-```
-
-## Local defaults
-
-- API: http://localhost:4000
-- Web: http://localhost:3000
-
-## Notes
-
-This repository is a good fit for teams that need:
-- workflow-driven booking systems
-- integration-ready backend design
-- multi-tenant scheduling products
-- operationally reliable state handling
+This repository is source-available for personal study, research, and evaluation.  
+Commercial use requires prior written permission and a separate paid license.  
+See `LICENSE` for details.
